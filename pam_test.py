@@ -53,7 +53,7 @@ try:
     print("Response JSON:", login_data)
 except Exception:
     print("Response is not valid JSON")
-    print("Response Text:", response.text[:500])
+    print("Response Text:", login_response.text[:500])
 
 # -------------------------
 # 2. CALL NEXT API
