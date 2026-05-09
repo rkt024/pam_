@@ -533,8 +533,8 @@ def sidebar():
     st.sidebar.divider()
 
     # 💰 COMPACT TRANSACTION FORM IN SIDEBAR
-    with st.sidebar.expander("💰 Quick Transactions", expanded=True):
-        t_id = st.text_input("Ref No.", max_chars=7, placeholder="1234567", key="t_id_sb")
+    with st.sidebar.expander("💰 Quick Response", expanded=False):
+        t_id = st.text_input("Ref No.", max_chars=7, placeholder="Enter Reference No.", key="t_id_sb")
         t_type = st.selectbox("Type", ["Rokka", "Fukuwa", "Others"], key="t_type_sb", index=2)
         remarks = st.text_area(
             "Remarks", 
@@ -604,20 +604,32 @@ def sidebar():
 # ---------------------------------------------------
 def login_page():
 
-    st.title("🔐 Login")
-    st.markdown("### DOLMA Registration System")
+    _, center, _ = st.columns([3, 1.2, 3])
 
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
+    with center:
 
-    if st.button("Login"):
-        if not username or not password:
-            st.warning("Enter username and password")
-            return
-        if login_api(username, password):
-            st.success("Login successful")
-            st.rerun()
+        st.subheader("🔐 Login")
 
+        username = st.text_input(
+            "Username",
+            placeholder="Enter username"
+        )
+
+        password = st.text_input(
+            "Password",
+            type="password",
+            placeholder="Enter password"
+        )
+
+        if st.button("Login", use_container_width=True):
+
+            if not username or not password:
+                st.warning("Enter username and password")
+                return
+
+            if login_api(username, password):
+                st.success("Login successful")
+                st.rerun()
 
 # ---------------------------------------------------
 # MAIN
