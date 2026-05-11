@@ -78,7 +78,7 @@ def login_api(username, password):
                 f"{BASE_URL}/pam/api/auth/login",
                 headers=BASE_HEADERS,
                 json=payload,
-                timeout=15,
+                timeout=50,
                 verify=VERIFY_SSL
             )
 
@@ -132,7 +132,7 @@ def api_call(url, method="POST", **kwargs):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     kwargs["headers"] = headers
-    kwargs.setdefault("timeout", 15)
+    kwargs.setdefault("timeout", 50)
     kwargs.setdefault("verify", VERIFY_SSL)
 
     res = session.request(method, url, **kwargs)
@@ -146,7 +146,7 @@ def api_call(url, method="POST", **kwargs):
                 f"{BASE_URL}/pam/api/auth/login",
                 headers=BASE_HEADERS,
                 json={"usernameOrEmail": u, "password": p, "remember": True},
-                timeout=15, verify=VERIFY_SSL
+                timeout=50, verify=VERIFY_SSL
             )
             if login_res.status_code == 200 and login_res.json().get("status"):
                 new_token = login_res.json()["data"]["accessToken"]
@@ -561,11 +561,81 @@ def sidebar():
                         "Fukuwa": f"{BASE_URL}/pam/app/fukuwa/data/send/{t_id}",
                         "Others": f"{BASE_URL}/pam/app/all/data/send/{t_id}"
                     }
-                    res = api_call(url_map[t_type], json={})
-                    if res and res.ok:
-                        st.sidebar.success(f"✅ {t_type} transferred")
+
+                    url = url_map[t_type]
+
+                    # Fukuwa does not require payload
+                    if t_type == "Fukuwa":
+                        res = api_call(url)
                     else:
-                        st.sidebar.error(f"❌ Failed: {res.status_code if res else 'No response'}")
+                        res = api_call(url, json={})
+
+                    if res and res.ok:
+                        response_data = res.json()
+
+                        if response_data.get("status"):
+                            message = response_data.get("message", "Success")
+                            reference_no = response_data.get("data", {}).get("referenceNo", "N/A")
+
+                            st.sidebar.success(
+                                f"✅ {t_type} transferred successfully\n"
+                                f"📌 Ref No: {reference_no}"
+                            )
+
+                            st.sidebar.info(f"ℹ️ {message}")
+
+                        else:
+                            st.sidebar.error(
+                                f"❌ Transfer failed: {response_data.get('message', 'Unknown error')}"
+                            )
+
+                    else:
+                        st.sidebar.error(
+                            f"❌ Failed: {res.status_code if res else 'No response'}"
+                        )
+
+                        if res:
+                            st.sidebar.code(res.text)
+
+                except Exception as e:
+                    st.sidebar.error(f"❌ Error: {e}")
+                    
+            if not is_valid:
+                st.sidebar.warning("Enter valid 7-digit ID")
+            else:
+                try:
+                    url_map = {
+                        "Rokka": f"{BASE_URL}/pam/app/rokka/data/send/{t_id}",
+                        "Fukuwa": f"{BASE_URL}/pam/app/fukuwa/data/send/{t_id}",
+                        "Others": f"{BASE_URL}/pam/app/all/data/send/{t_id}"
+                    }
+                    
+                    res = api_call(url_map[t_type], json={})
+
+                    if res and res.ok:
+                        response_data = res.json()
+
+                        if response_data.get("status"):
+                            message = response_data.get("message", "Success")
+                            reference_no = response_data.get("data", {}).get("referenceNo", "N/A")
+
+                            st.sidebar.success(
+                                f"✅ {t_type} transferred successfully\n"
+                                f"📌 Ref No: {reference_no}"
+                            )
+
+                            st.sidebar.info(f"ℹ️ {message}")
+
+                        else:
+                            st.sidebar.error(
+                                f"❌ Transfer failed: {response_data.get('message', 'Unknown error')}"
+                            )
+
+                    else:
+                        st.sidebar.error(
+                            f"❌ Failed: {res.status_code if res else 'No response'}"
+                        )
+
                 except Exception as e:
                     st.sidebar.error(f"❌ Error: {e}")
 
@@ -577,11 +647,32 @@ def sidebar():
             else:
                 try:
                     url = f"{BASE_URL}/pam/app/submit/deed/application/{t_id}/6"
+                     
                     res = api_call(url, json={"remarks": remarks})
                     if res and res.ok:
-                        st.sidebar.success("✅ Returned successfully")
+                        response_data = res.json()
+
+                        if response_data.get("status"):
+                            message = response_data.get("message", "Success")
+                            submitted_id = response_data.get("data")
+
+                            st.sidebar.success(
+                                f"✅ Returned successfully\n"
+                                f"📌 Submission ID: {submitted_id}"
+                            )
+
+                            st.sidebar.info(f"ℹ️ {message}")
+
+                        else:
+                            st.sidebar.error(
+                                f"❌ Failed: {response_data.get('message', 'Unknown error')}"
+                            )
+
                     else:
-                        st.sidebar.error(f"❌ Failed: {res.status_code if res else 'No response'}")
+                        st.sidebar.error(
+                            f"❌ Failed: {res.status_code if res else 'No response'}"
+                        )
+
                 except Exception as e:
                     st.sidebar.error(f"❌ Error: {e}")
 
