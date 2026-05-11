@@ -135,6 +135,15 @@ def api_call(url, method="POST", **kwargs):
     kwargs.setdefault("timeout", 50)
     kwargs.setdefault("verify", VERIFY_SSL)
 
+    if method == "GET":
+        res = session.get(
+            url,
+            headers=headers,
+            timeout=30,
+            verify=VERIFY_SSL
+        )
+        return res 
+
     res = session.request(method, url, **kwargs)
 
     # If unauthorized, re-login and retry ONCE
@@ -566,7 +575,7 @@ def sidebar():
 
                     # Fukuwa does not require payload
                     if t_type == "Fukuwa":
-                        res = api_call(url)
+                        res = api_call(url, method="GET")
                     else:
                         res = api_call(url, json={})
 
