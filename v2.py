@@ -1,25 +1,19 @@
 import streamlit as st
 import requests
 import pandas as pd
-from dotenv import load_dotenv
 import urllib3
 import math
-import os
+from dotenv import load_dotenv
 
 # ---------------------------------------------------
 # CONFIG
 # ---------------------------------------------------
 load_dotenv()
-
 VERIFY_SSL = False
-
 if not VERIFY_SSL:
-    urllib3.disable_warnings(
-        urllib3.exceptions.InsecureRequestWarning
-    )
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://public.dolma.gov.np"
-
 BASE_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
@@ -29,101 +23,39 @@ BASE_HEADERS = {
     "user-type": "3"
 }
 
-PAGE_SIZE = 5
+PAGES = [
+    "Likhat Parit", "Jagga Darta", "Namsari", "Dakhil Kharej",
+    "Samsodan", "Halsabik", "Rokka/Fukuwa", "Apartment",
+    "Pratilipi", "Guthi Adhinastha"
+]
+
+PROCESS_IDS = {
+    "Likhat Parit": "1", "Jagga Darta": "2", "Namsari": "3", "Dakhil Kharej": "4",
+    "Samsodan": "5", "Halsabik": "7", "Rokka/Fukuwa": "8,15", "Apartment": "16",
+    "Pratilipi": "21", "Guthi Adhinastha": "22"
+}
+
+ROWS_PER_PAGE = 7
+st.set_page_config(page_title="DOLMA Office Portal", page_icon="🏛️", layout="wide")
 
 # ---------------------------------------------------
-# PAGE CONFIG
+# SESSION STATE INIT
 # ---------------------------------------------------
-st.set_page_config(
-    page_title="DOLMA Dashboard",
-    page_icon="📄",
-    layout="wide"
-)
-
-# ---------------------------------------------------
-# SESSION INIT
-# ---------------------------------------------------
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-
-if "page" not in st.session_state:
-    st.session_state["page"] = 1
-
-if "expanded_row" not in st.session_state:
-    st.session_state["expanded_row"] = None
-
-if "detail_cache" not in st.session_state:
-    st.session_state["detail_cache"] = {}
-
-if "http_session" not in st.session_state:
-    st.session_state["http_session"] = requests.Session()
+defaults = {
+    "logged_in": False, "token": None, "user_id": None, "role_id": None,
+    "office_id": None, "username": None, "password": None,
+    "selected_page": PAGES[0], "table_data": None,
+    "page_num": 1, "search_query": "", "expanded_row": None,
+    "return_mode_ref": None, "http_session": requests.Session()
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 session = st.session_state["http_session"]
 
 # ---------------------------------------------------
-# LOGIN API
-# ---------------------------------------------------
-def login_api(username, password):
-
-    payload = {
-        "usernameOrEmail": username,
-        "password": password,
-        "remember": True
-    }
-
-    try:
-        with st.spinner("Logging in..."):
-
-            res = session.post(
-                f"{BASE_URL}/pam/api/auth/login",
-                headers=BASE_HEADERS,
-                json=payload,
-                timeout=50,
-                verify=VERIFY_SSL
-            )
-
-        if res.status_code != 200:
-            st.error(f"Server Error: {res.status_code}")
-            return False
-
-        data = res.json()
-
-        if not data.get("status"):
-            st.error("Invalid username or password")
-            return False
-
-        user = data["data"]["user"]
-        roles = user.get("roles", [])
-
-        role_id = roles[0].get("roleId") if roles else None
-
-        if not role_id:
-            st.error("No valid role assigned")
-            return False
-
-        st.session_state.update({
-            "token": data["data"]["accessToken"],
-            "user_id": user.get("userId"),
-            "office_id": user.get("officeId"),
-            "role_id": role_id,
-            "username": username,
-            "password": password,  # 👈 Stored for auto-relogin
-            "logged_in": True
-        })
-
-        return True
-
-    except requests.exceptions.Timeout:
-        st.error("Request timeout")
-
-    except Exception as e:
-        st.error(f"Login Error: {e}")
-
-    return False
-
-
-# ---------------------------------------------------
-# 🔑 SIMPLE AUTO-RELOGIN WRAPPER
+# API CLIENT
 # ---------------------------------------------------
 def api_call(url, method="POST", **kwargs):
     """Makes a request. If 401/403, relogs in and retries ONCE."""
@@ -132,624 +64,316 @@ def api_call(url, method="POST", **kwargs):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     kwargs["headers"] = headers
-    kwargs.setdefault("timeout", 50)
+    kwargs.setdefault("timeout", 30)
     kwargs.setdefault("verify", VERIFY_SSL)
-
-    if method == "GET":
-        res = session.get(
-            url,
-            headers=headers,
-            timeout=30,
-            verify=VERIFY_SSL
-        )
-        return res 
-
-    res = session.request(method, url, **kwargs)
-
-    # If unauthorized, re-login and retry ONCE
-    if res.status_code in [401, 403]:
-        u = st.session_state.get("username")
-        p = st.session_state.get("password")
-        if u and p:
-            login_res = session.post(
-                f"{BASE_URL}/pam/api/auth/login",
-                headers=BASE_HEADERS,
-                json={"usernameOrEmail": u, "password": p, "remember": True},
-                timeout=50, verify=VERIFY_SSL
-            )
-            if login_res.status_code == 200 and login_res.json().get("status"):
-                new_token = login_res.json()["data"]["accessToken"]
-                st.session_state["token"] = new_token
-                headers["Authorization"] = f"Bearer {new_token}"
-                kwargs["headers"] = headers
-                res = session.request(method, url, **kwargs)
-    return res
-
-
-# ---------------------------------------------------
-# FETCH REGISTRATION DATA
-# ---------------------------------------------------
-@st.cache_data(ttl=300)
-def fetch_registration_data_cached(
-    token,
-    user_id,
-    role_id,
-    office_id
-):
-
-    headers = {
-        **BASE_HEADERS,
-        "Authorization": f"Bearer {token}"
-    }
-
-    payload = {
-        "pid": "8,15",
-        "statusid": 1,
-        "userid": user_id,
-        "roleid": role_id,
-        "officeid": office_id,
-    }
-
-    res = api_call(
-        f"{BASE_URL}/pam/app/allregprocess",
-        json=payload,
-        headers=headers
-    )
-
-    if res.status_code != 200:
-        raise Exception(f"API Error: {res.status_code}")
-
-    data = res.json().get("data", [])
-
-    df = pd.DataFrame([
-        {
-            "reference_no": r.get("referenceno"),
-            "username": r.get("username"),
-            "date": r.get("dateofapplication"),
-            "process": r.get("processname"),
-            "agency": r.get("rokkaagency")
-        }
-        for r in data
-    ])
-
-    if df.empty:
-        return df
-
-    df["reference_no"] = pd.to_numeric(
-        df["reference_no"],
-        errors="coerce"
-    ).astype("Int64")
-
-    df = df.sort_values(
-        by="reference_no",
-        ascending=False
-    ).reset_index(drop=True)
-
-    return df
-
-
-def fetch_registration_data():
-
-    token = st.session_state.get("token")
-
-    if not token:
-        st.error("Session expired")
-        return pd.DataFrame()
-
-    if not st.session_state.get("role_id"):
-        st.error("Invalid role")
-        return pd.DataFrame()
-
+    
     try:
-        with st.spinner("Loading registration data..."):
-
-            df = fetch_registration_data_cached(
-                token,
-                st.session_state["user_id"],
-                st.session_state["role_id"],
-                st.session_state["office_id"]
-            )
-
-        return df
-
+        res = session.request(method, url, **kwargs)
+        if res.status_code in (401, 403):
+            u, p = st.session_state.get("username"), st.session_state.get("password")
+            if u and p:
+                login_res = session.post(
+                    f"{BASE_URL}/pam/api/auth/login",
+                    headers=BASE_HEADERS,
+                    json={"usernameOrEmail": u, "password": p, "remember": True},
+                    timeout=30, verify=VERIFY_SSL
+                )
+                if login_res.ok and login_res.json().get("status"):
+                    new_token = login_res.json()["data"]["accessToken"]
+                    st.session_state["token"] = new_token
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    kwargs["headers"] = headers
+                    res = session.request(method, url, **kwargs)
+        return res
     except Exception as e:
-        st.error(f"Fetch Error: {e}")
-
-    return pd.DataFrame()
-
-
-# ---------------------------------------------------
-# FETCH DETAIL WITH CACHE
-# ---------------------------------------------------
-@st.cache_data(ttl=600)
-def fetch_detail_cached(ref, token):
-
-    headers = {
-        **BASE_HEADERS,
-        "Authorization": f"Bearer {token}"
-    }
-
-    url = f"{BASE_URL}/pam/app/rokka/application/detail/{ref}"
-
-    res = api_call(url, headers=headers)
-
-    if res.status_code != 200:
-        raise Exception(f"Detail API Error: {res.status_code}")
-
-    return res.json().get("data")
-
-
-def fetch_detail(ref):
-
-    token = st.session_state.get("token")
-
-    if not token:
-        st.error("Session expired")
+        st.error(f"API Error: {e}")
         return None
 
+def login_api(username, password):
     try:
-        with st.spinner(f"Loading detail for {ref}..."):
-
-            data = fetch_detail_cached(ref, token)
-
-        return data
-
+        with st.spinner("Logging in..."):
+            res = api_call(f"{BASE_URL}/pam/api/auth/login", headers=BASE_HEADERS, 
+                           json={"usernameOrEmail": username, "password": password, "remember": True})
+        if not res or res.status_code != 200:
+            st.error(f"Server Error: {res.status_code if res else 'No Response'}")
+            return False
+        data = res.json()
+        if not data.get("status"):
+            st.error("Invalid username or password")
+            return False
+            
+        user = data["data"]["user"]
+        roles = user.get("roles", [])
+        role_id = roles[0].get("roleId") if roles else None
+        if not role_id:
+            st.error("No valid role assigned")
+            return False
+            
+        st.session_state.update({
+            "token": data["data"]["accessToken"],
+            "user_id": user.get("userId"),
+            "office_id": user.get("officeId"),
+            "role_id": role_id,
+            "username": username, "password": password, "logged_in": True
+        })
+        return True
     except Exception as e:
-        st.error(f"Detail Fetch Error: {e}")
+        st.error(f"Login Error: {e}")
+        return False
 
+@st.cache_data(ttl=300)
+def fetch_registration_data_cached(token, user_id, role_id, office_id, pid):
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"pid": pid, "statusid": 1, "userid": user_id, "roleid": role_id, "officeid": office_id}
+    
+    res = api_call(f"{BASE_URL}/pam/app/allregprocess", json=payload, headers=headers)
+    if not res or res.status_code != 200:
+        return pd.DataFrame()
+        
+    data = res.json().get("data", [])
+    if not data:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame([{
+        "reference_no": r.get("referenceno"),
+        "username": r.get("username"),
+        "date": r.get("dateofapplication"),
+        "process": r.get("processname"),
+        "agency": r.get("rokkaagency")
+    } for r in data])
+    
+    df["reference_no"] = pd.to_numeric(df["reference_no"], errors="coerce").astype("Int64")
+    return df.sort_values("reference_no", ascending=False).reset_index(drop=True)
+
+@st.cache_data(ttl=600)
+def fetch_detail_cached(ref, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    res = api_call(f"{BASE_URL}/pam/app/rokka/application/detail/{ref}", headers=headers)
+    if res and res.status_code == 200:
+        return res.json().get("data")
     return None
 
+# ---------------------------------------------------
+# ROW ACTIONS
+# ---------------------------------------------------
+def do_transfer(ref, process_name):
+    pn = (process_name or "").lower()
+    if "rokka" in pn:
+        url, method = f"{BASE_URL}/pam/app/rokka/data/send/{ref}", "POST"
+    elif "fukuwa" in pn:
+        url, method = f"{BASE_URL}/pam/app/fukuwa/data/send/{ref}", "GET"
+    else:
+        url, method = f"{BASE_URL}/pam/app/all/data/send/{ref}", "POST"
+        
+    res = api_call(url, method=method, json={} if method == "POST" else None)
+    if res and res.ok:
+        d = res.json()
+        if d.get("status"):
+            st.success(f"✅ Transferred: {d.get('data', {}).get('referenceNo', 'N/A')}")
+        else:
+            st.error(f"❌ Failed: {d.get('message', 'Unknown')}")
+    else:
+        st.error(f"❌ Transfer Error: {res.status_code if res else 'No Response'}")
+
+def do_return(ref, remarks):
+    res = api_call(f"{BASE_URL}/pam/app/submit/deed/application/{ref}/6", json={"remarks": remarks})
+    if res and res.ok:
+        d = res.json()
+        if d.get("status"):
+            st.success(f"✅ Returned successfully (ID: {d.get('data')})")
+        else:
+            st.error(f"❌ Failed: {d.get('message', 'Unknown')}")
+    else:
+        st.error(f"❌ Return Error: {res.status_code if res else 'No Response'}")
 
 # ---------------------------------------------------
-# DASHBOARD
+# UI COMPONENTS
 # ---------------------------------------------------
-def dashboard_home():
-
-    st.title("📊 Dashboard")
-
-    df = st.session_state.get("table_data")
-
-    if df is None or df.empty:
-        st.info("Load data from sidebar")
-        return
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Total Records", len(df))
-    col2.metric("Unique Users", df["username"].nunique())
-    col3.metric("Processes", df["process"].nunique())
-
-    st.subheader("Process Distribution")
-
-    st.bar_chart(df["process"].value_counts())
-
-
-# ---------------------------------------------------
-# RECORDS PAGE
-# ---------------------------------------------------
-def table_page():
-
-    st.title("📋 Registration Records")
+def render_table(page_name):
+    pid = PROCESS_IDS[page_name]
+    is_rokka = (page_name == "Rokka/Fukuwa")
     
-    st.markdown(
-    """
-    <style>
-    div[data-testid="stVerticalBlock"] > div {
-        padding-top: 0rem !important;
-        padding-bottom: 0rem !important;
-        margin-top: 0rem !important;
-        margin-bottom: 0rem !important;
-    }
+    # Lazy Load Data
+    if st.session_state["table_data"] is None or st.session_state.get("_last_pid") != pid:
+        with st.spinner(f"Loading {page_name}..."):
+            df = fetch_registration_data_cached(
+                st.session_state["token"],
+                st.session_state["user_id"],
+                st.session_state["role_id"],
+                st.session_state["office_id"],
+                pid
+            )
+            st.session_state["table_data"] = df
+            st.session_state["_last_pid"] = pid
+            st.session_state["page_num"] = 1
+            st.session_state["search_query"] = ""
+            st.session_state["expanded_row"] = None
+            st.session_state["return_mode_ref"] = None
 
-    div[data-testid="element-container"] {
-        margin-bottom: 0rem !important;
-    }
-
-    hr {
-        margin-top: 0.2rem !important;
-        margin-bottom: 0.2rem !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-    )
-
-    df = st.session_state.get("table_data")
-
-    if df is None or df.empty:
-        st.warning("No data loaded")
-        return
-
-    search = st.text_input("🔍 Search")
-
-    if search:
-        df = df[
-            df["reference_no"].astype(str).str.contains(search, case=False, na=False)
-            |
-            df["username"].astype(str).str.contains(search, case=False, na=False)
-            |
-            df["process"].astype(str).str.contains(search, case=False, na=False)
-            |
-            df["agency"].astype(str).str.contains(search, case=False, na=False)
-        ]
-
+    df = st.session_state["table_data"]
     if df.empty:
-        st.warning("No matching records")
+        st.info("No records found.")
         return
 
-    csv = df.to_csv(index=False).encode("utf-8")
-
-    st.download_button(
-        "📥 Export CSV",
-        csv,
-        "registration_data.csv",
-        "text/csv"
-    )
-
-    st.markdown("<hr>", unsafe_allow_html=True)
-
-    total_pages = max(1, math.ceil(len(df) / PAGE_SIZE))
-    current_page = st.session_state["page"]
-    current_page = max(1, min(current_page, total_pages))
-    st.session_state["page"] = current_page
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-
-    with col1:
-        if st.button("⬅ Prev"):
-            if current_page > 1:
-                st.session_state["page"] -= 1
-                st.session_state["expanded_row"] = None
-                st.rerun()
-
-    with col3:
-        if st.button("Next ➡"):
-            if current_page < total_pages:
-                st.session_state["page"] += 1
-                st.session_state["expanded_row"] = None
-                st.rerun()
-
-    col2.markdown(
-        f"<center><b>Page {current_page} / {total_pages}</b></center>",
-        unsafe_allow_html=True
-    )
-
-    start = (current_page - 1) * PAGE_SIZE
-    end = start + PAGE_SIZE
-    page_df = df.iloc[start:end]
-
+    # Search
+    search = st.text_input("🔍 Search", value=st.session_state["search_query"], key="search_input")
+    if search:
+        mask = df.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
+        df = df[mask]
+    st.session_state["search_query"] = search
+    
+    total = len(df)
+    total_pages = max(1, math.ceil(total / ROWS_PER_PAGE))
+    st.session_state["page_num"] = max(1, min(st.session_state["page_num"], total_pages))
+    
+    # Pagination
+    c1, _, _, c2 = st.columns([1, 2, 2, 1])
+    if c1.button("⬅ Prev", disabled=st.session_state["page_num"]==1, key="btn_prev"):
+        st.session_state["page_num"] -= 1; st.session_state["expanded_row"] = None; st.session_state["return_mode_ref"] = None; st.rerun()
+    c2.text(f"Page {st.session_state['page_num']}/{total_pages} ({total} records)")
+    if c2.button("Next ➡", disabled=st.session_state["page_num"]==total_pages, key="btn_next"):
+        st.session_state["page_num"] += 1; st.session_state["expanded_row"] = None; st.session_state["return_mode_ref"] = None; st.rerun()
+        
+    st.download_button("📥 Export CSV", df.to_csv(index=False).encode("utf-8"), f"{page_name}.csv", "text/csv", key="btn_csv")
     st.divider()
 
-    h1, h2, h3, h4, h5, h6 = st.columns([2, 2, 2, 2, 2, 1])
-    h1.markdown("**Ref No**")
-    h2.markdown("**User**")
-    h3.markdown("**Date**")
-    h4.markdown("**Process**")
-    h5.markdown("**Agency**")
-    h6.markdown("")
+    # Table Header
+    col_defs = st.columns([1.5, 1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8]) if is_rokka else st.columns([1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8])
+    headers = ["Ref No", "User", "Date", "Process", "Agency", "", "", ""] if is_rokka else ["Ref No", "User", "Date", "Process", "", "", ""]
+    for i, h in enumerate(headers):
+        col_defs[i].markdown(f"**{h}**")
     st.divider()
 
+    # Table Rows
+    start = (st.session_state["page_num"] - 1) * ROWS_PER_PAGE
+    page_df = df.iloc[start:start+ROWS_PER_PAGE]
+    
     for _, row in page_df.iterrows():
-        ref = row["reference_no"]
-        c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2, 2, 1])
+        ref = str(row["reference_no"])
+        cols = st.columns([1.5, 1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8]) if is_rokka else st.columns([1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8])
+        
+        idx_offset = 5 if is_rokka else 4
+        cols[0].write(ref)
+        cols[1].write(row["username"])
+        cols[2].write(row["date"])
+        cols[3].write(row["process"])
+        if is_rokka:
+            cols[4].write(row.get("agency", "-") or "-")
 
-        c1.write(ref)
-        c2.write(row["username"])
-        c3.write(row["date"])
-        c4.write(row["process"])
-        c5.write(row["agency"])
-
+        # View Button (Rokka/Fukuwa Only)
         expanded = st.session_state.get("expanded_row") == ref
-        button_text = "Hide" if expanded else "View"
+        if is_rokka:
+            if cols[idx_offset].button("👁️ View" if not expanded else "Hide", key=f"view_{ref}", type="primary" if not expanded else "secondary", use_container_width=True):
+                if expanded: st.session_state["expanded_row"] = None
+                else: st.session_state["expanded_row"] = ref
+                st.session_state["return_mode_ref"] = None
+                st.rerun()
 
-        if c6.button(button_text, key=f"view_{ref}"):
-            if expanded:
-                st.session_state["expanded_row"] = None
-            else:
-                st.session_state["expanded_row"] = ref
+        # Transfer Button
+        if cols[idx_offset+1].button("🔄 Transfer", key=f"tr_{ref}", use_container_width=True):
+            do_transfer(ref, row["process"])
             st.rerun()
+            
+        # Return Button
+        return_mode = st.session_state.get("return_mode_ref") == ref
+        if cols[idx_offset+2].button("↩️ Return", key=f"ret_{ref}", use_container_width=True):
+            if not return_mode:
+                st.session_state["return_mode_ref"] = ref
+                st.session_state["expanded_row"] = None
+                st.rerun()
 
-        if expanded:
-            detail = fetch_detail(ref)
-            if detail:
-                process = detail.get("PROCESSREGISTRATION", {})
-                prop = detail.get("PROPERTYDETAIL", [])
+        # Inline Return Form
+        if return_mode:
+            with st.container(border=True):
+                remarks = st.text_input("Remarks", value="भू सेवाबाट माग भए बमोजिम फिर्ता ।", key=f"remarks_{ref}")
+                c_c, c_x = st.columns(2)
+                if c_c.button("✅ Confirm Return", key=f"conf_ret_{ref}", type="primary", use_container_width=True):
+                    do_return(ref, remarks)
+                    st.session_state["return_mode_ref"] = None
+                    st.rerun()
+                if c_x.button("❌ Cancel", key=f"cancel_ret_{ref}", use_container_width=True):
+                    st.session_state["return_mode_ref"] = None
+                    st.rerun()
+            st.divider()
 
-                munc = "-"
-                if isinstance(prop, list) and len(prop) > 0: 
-                    munc = prop[0].get("MUNCNAME_NP", "-")
-                agency = "-"
+        # Expanded Detail (Rokka/Fukuwa Only)
+        if expanded and is_rokka:
+            with st.container(border=True):
+                detail = fetch_detail_cached(ref, st.session_state["token"])
+                if detail:
+                    # Exact logic from original app.py
+                    process = detail.get("PROCESSREGISTRATION", {})
+                    prop = detail.get("PROPERTYDETAIL", [])
 
-                process_name = process.get("processname", "").lower()
+                    munc = "-"
+                    if isinstance(prop, list) and len(prop) > 0: 
+                        munc = prop[0].get("MUNCNAME_NP", "-")
+                    agency_detail = "-"
 
-                if "rokka" in process_name:
-                    rokka_info = detail.get("ROKKAINFORMATION", [])
-                    if isinstance(rokka_info, list) and len(rokka_info) > 0:
-                        agency = rokka_info[0].get("AGENCYNAME_NP", "-")
+                    process_name = process.get("processname", " ").lower()
+
+                    if "rokka" in process_name:
+                        rokka_info = detail.get("ROKKAINFORMATION", [])
+                        if isinstance(rokka_info, list) and len(rokka_info) > 0:
+                            agency_detail = rokka_info[0].get("AGENCYNAME_NP", "-")
+                    else:
+                        fukuwa = detail.get("data", {}).get("fukuwaDetails", [])
+                        if isinstance(fukuwa, list) and len(fukuwa) > 0:
+                            agency_detail = fukuwa[0].get("tblrokkaagency", {}).get("agencyname_np", "-")
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    # c1.metric("Municipality", munc)
+                    # c2.metric("Agency", agency_detail)
+                    # c3.metric("Process", process.get("processname", "-"))
+                    # c4.metric("Date", process.get("dateofapplication", "-"))
+
+                    c1.markdown(f"**Municipality**  \n<small>{munc}</small>", unsafe_allow_html=True)
+                    c2.markdown(f"**Agency**  \n<small>{agency_detail}</small>", unsafe_allow_html=True)
+                    c3.markdown(f"**Process**  \n<small>{process.get('processname', '-')}</small>", unsafe_allow_html=True)
+                    c4.markdown(f"**Date**  \n<small>{process.get('dateofapplication', '-')}</small>", unsafe_allow_html=True)
                 else:
-                    fukuwa = detail.get("data", {}).get("fukuwaDetails", [])
-                    if isinstance(fukuwa, list) and len(fukuwa) > 0:
-                        agency = fukuwa[0].get("tblrokkaagency", {}).get("agencyname_np", "-")
+                    st.error("❌ Failed to load detail data")
+            st.divider()
 
-                st.markdown(
-                    """
-                    <style>
-                    .mini-detail {
-                        background-color: #f8f9fa;
-                        padding: 10px 15px;
-                        border-radius: 6px;
-                        margin-top: 5px;
-                        margin-bottom: 10px;
-                        border: 1px solid #e6e6e6;
-                        font-size: 14px;
-                    }
-                    </style>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-                d1, d2, d3, d4, d5 = st.columns([2, 2, 2, 2, 2])
-                with d1:
-                    st.caption("Reference")
-                    st.write(process.get("referenceno", ref))
-                with d2:
-                    st.caption("Municipality")
-                    st.write(munc)
-                with d3:
-                    st.caption("Agency")
-                    st.write(agency)
-                with d4:
-                    st.caption("Process")
-                    st.write(process.get("processname", "-"))
-                with d5:
-                    st.caption("Application Date")
-                    st.write(process.get("dateofapplication", "-"))
-            else:
-                st.error("Failed to load detail")
-
-        st.divider()
-
-
-# ---------------------------------------------------
-# SIDEBAR (With Compact Transactions)
-# ---------------------------------------------------
 def sidebar():
-
-    st.sidebar.title("🏛 Admin Panel")
-    st.sidebar.write(f"👤 {st.session_state.get('username', '')}")
+    st.sidebar.title("🏛️ DOLMA Portal")
+    st.sidebar.caption(f"👤 {st.session_state.get('username', '')}")
     st.sidebar.divider()
-
-    if st.sidebar.button("📥 Load Data"):
-        df = fetch_registration_data()
-        st.session_state["table_data"] = df
-        st.session_state["page"] = 1
+    
+    selected = st.sidebar.radio("📂 Workspaces", PAGES, key="nav_radio", index=PAGES.index(st.session_state["selected_page"]))
+    st.session_state["selected_page"] = selected
+    
+    # Reset state on page switch
+    if selected != st.session_state.get("_last_page_rendered"):
+        st.session_state["_last_page_rendered"] = selected
+        st.session_state["table_data"] = None
+        st.session_state["page_num"] = 1
         st.session_state["expanded_row"] = None
-        if not df.empty:
-            st.sidebar.success(f"{len(df)} records loaded")
-
+        
     st.sidebar.divider()
+    if st.sidebar.button("🧹 Clear Cache", key="btn_cache"): st.cache_data.clear(); st.sidebar.success("Cache cleared")
+    if st.sidebar.button("🚪 Logout", key="btn_logout"): st.session_state.clear(); st.rerun()
 
-    # Navigation (Transactions removed)
-    pages = ["Dashboard", "Records"]
-    default_page = st.session_state.get("page_name", "Dashboard")
-    selected_page = st.sidebar.radio(
-        "Navigate",
-        pages,
-        index=pages.index(default_page)
-    )
-    st.session_state["page_name"] = selected_page
-
-    st.sidebar.divider()
-
-    # 💰 COMPACT TRANSACTION FORM IN SIDEBAR
-    with st.sidebar.expander("💰 Quick Response", expanded=False):
-        t_id = st.text_input("Ref No.", max_chars=7, placeholder="Enter Reference No.", key="t_id_sb")
-        t_type = st.selectbox("Type", ["Rokka", "Fukuwa", "Others"], key="t_type_sb", index=2)
-        remarks = st.text_area(
-            "Remarks", 
-            value="भू सेवाबाट माग भए बमोजिम फिर्ता ।", 
-            height=60, 
-            key="t_remarks_sb"
-        )
-
-        col_t1, col_t2 = st.sidebar.columns(2)
-        t_transfer = col_t1.button("Transfer", use_container_width=True, key="btn_transfer_sb")
-        t_return = col_t2.button("Return", use_container_width=True, key="btn_return_sb")
-
-        is_valid = t_id.isdigit() and len(t_id) == 7
-        if t_id and not is_valid:
-            st.sidebar.error("⚠️ Enter exactly 7 digits")
-
-        if t_transfer:
-            if not is_valid:
-                st.sidebar.warning("Enter valid 7-digit ID")
-            else:
-                try:
-                    url_map = {
-                        "Rokka": f"{BASE_URL}/pam/app/rokka/data/send/{t_id}",
-                        "Fukuwa": f"{BASE_URL}/pam/app/fukuwa/data/send/{t_id}",
-                        "Others": f"{BASE_URL}/pam/app/all/data/send/{t_id}"
-                    }
-
-                    url = url_map[t_type]
-
-                    # Fukuwa does not require payload
-                    if t_type == "Fukuwa":
-                        res = api_call(url, method="GET")
-                    else:
-                        res = api_call(url, json={})
-
-                    if res and res.ok:
-                        response_data = res.json()
-
-                        if response_data.get("status"):
-                            message = response_data.get("message", "Success")
-                            reference_no = response_data.get("data", {}).get("referenceNo", "N/A")
-
-                            st.sidebar.success(
-                                f"✅ {t_type} transferred successfully\n"
-                                f"📌 Ref No: {reference_no}"
-                            )
-
-                            st.sidebar.info(f"ℹ️ {message}")
-
-                        else:
-                            st.sidebar.error(
-                                f"❌ Transfer failed: {response_data.get('message', 'Unknown error')}"
-                            )
-
-                    else:
-                        st.sidebar.error(
-                            f"❌ Failed: {res.status_code if res else 'No response'}"
-                        )
-
-                        if res:
-                            st.sidebar.code(res.text)
-
-                except Exception as e:
-                    st.sidebar.error(f"❌ Error: {e}")
-                    
-            if not is_valid:
-                st.sidebar.warning("Enter valid 7-digit ID")
-            else:
-                try:
-                    url_map = {
-                        "Rokka": f"{BASE_URL}/pam/app/rokka/data/send/{t_id}",
-                        "Fukuwa": f"{BASE_URL}/pam/app/fukuwa/data/send/{t_id}",
-                        "Others": f"{BASE_URL}/pam/app/all/data/send/{t_id}"
-                    }
-                    
-                    res = api_call(url_map[t_type], json={})
-
-                    if res and res.ok:
-                        response_data = res.json()
-
-                        if response_data.get("status"):
-                            message = response_data.get("message", "Success")
-                            reference_no = response_data.get("data", {}).get("referenceNo", "N/A")
-
-                            st.sidebar.success(
-                                f"✅ {t_type} transferred successfully\n"
-                                f"📌 Ref No: {reference_no}"
-                            )
-
-                            st.sidebar.info(f"ℹ️ {message}")
-
-                        else:
-                            st.sidebar.error(
-                                f"❌ Transfer failed: {response_data.get('message', 'Unknown error')}"
-                            )
-
-                    else:
-                        st.sidebar.error(
-                            f"❌ Failed: {res.status_code if res else 'No response'}"
-                        )
-
-                except Exception as e:
-                    st.sidebar.error(f"❌ Error: {e}")
-
-        if t_return:
-            if not is_valid:
-                st.sidebar.warning("Enter valid 7-digit ID")
-            elif not remarks.strip():
-                st.sidebar.warning("Remarks cannot be empty")
-            else:
-                try:
-                    url = f"{BASE_URL}/pam/app/submit/deed/application/{t_id}/6"
-                     
-                    res = api_call(url, json={"remarks": remarks})
-                    if res and res.ok:
-                        response_data = res.json()
-
-                        if response_data.get("status"):
-                            message = response_data.get("message", "Success")
-                            submitted_id = response_data.get("data")
-
-                            st.sidebar.success(
-                                f"✅ Returned successfully\n"
-                                f"📌 Submission ID: {submitted_id}"
-                            )
-
-                            st.sidebar.info(f"ℹ️ {message}")
-
-                        else:
-                            st.sidebar.error(
-                                f"❌ Failed: {response_data.get('message', 'Unknown error')}"
-                            )
-
-                    else:
-                        st.sidebar.error(
-                            f"❌ Failed: {res.status_code if res else 'No response'}"
-                        )
-
-                except Exception as e:
-                    st.sidebar.error(f"❌ Error: {e}")
-
-    st.sidebar.divider()
-
-    if st.sidebar.button("🧹 Clear Cache"):
-        st.cache_data.clear()
-        st.sidebar.success("Cache cleared")
-
-    if st.sidebar.button("🚪 Logout"):
-        st.session_state.pop("password", None)
-        st.session_state.clear()
-        st.rerun()
-
-    return selected_page
-
-
-# ---------------------------------------------------
-# LOGIN PAGE
-# ---------------------------------------------------
 def login_page():
-
     _, center, _ = st.columns([3, 1.2, 3])
-
     with center:
-
-        st.subheader("🔐 Login")
-
-        username = st.text_input(
-            "Username",
-            placeholder="Enter username"
-        )
-
-        password = st.text_input(
-            "Password",
-            type="password",
-            placeholder="Enter password"
-        )
-
-        if st.button("Login", use_container_width=True):
-
+        st.title("🔐 DOLMA Login")
+        username = st.text_input("Username", key="login_user")
+        password = st.text_input("Password", type="password", key="login_pass")
+        if st.button("Sign In", use_container_width=True, type="primary", key="btn_login"):
             if not username or not password:
-                st.warning("Enter username and password")
+                st.warning("Enter credentials")
                 return
-
             if login_api(username, password):
                 st.success("Login successful")
                 st.rerun()
 
-# ---------------------------------------------------
-# MAIN
-# ---------------------------------------------------
 def main():
-
     if not st.session_state["logged_in"]:
         login_page()
         return
+    sidebar()
+    render_table(st.session_state["selected_page"])
 
-    page = sidebar()
-
-    if page == "Dashboard":
-        dashboard_home()
-    elif page == "Records":
-        table_page()
-
-
-# ---------------------------------------------------
-# ENTRY
-# ---------------------------------------------------
 if __name__ == "__main__":
     main()
