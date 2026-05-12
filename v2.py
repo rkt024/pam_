@@ -24,9 +24,17 @@ BASE_HEADERS = {
 }
 
 PAGES = [
-    "Likhat Parit", "Jagga Darta", "Namsari", "Dakhil Kharej",
-    "Samsodan", "Halsabik", "Rokka/Fukuwa", "Apartment",
-    "Pratilipi", "Guthi Adhinastha"
+    "Dashboard",
+    "Likhat Parit",
+    "Jagga Darta",
+    "Namsari",
+    "Dakhil Kharej",
+    "Samsodan",
+    "Halsabik",
+    "Rokka/Fukuwa",
+    "Apartment",
+    "Pratilipi",
+    "Guthi Adhinastha"
 ]
 
 PROCESS_IDS = {
@@ -36,18 +44,50 @@ PROCESS_IDS = {
 }
 
 ROWS_PER_PAGE = 7
+
+st.markdown("""
+<style>
+
+/* Hide top multipage navigation */
+[data-testid="stSidebarNav"] {
+    display: none;
+}
+
+/* Optional: remove extra top spacing */
+[data-testid="stSidebarContent"] {
+    padding-top: 1rem;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
 st.set_page_config(page_title="DOLMA Office Portal", page_icon="🏛️", layout="wide")
 
 # ---------------------------------------------------
 # SESSION STATE INIT
 # ---------------------------------------------------
 defaults = {
-    "logged_in": False, "token": None, "user_id": None, "role_id": None,
-    "office_id": None, "username": None, "password": None,
-    "selected_page": PAGES[0], "table_data": None,
-    "page_num": 1, "search_query": "", "expanded_row": None,
-    "return_mode_ref": None, "http_session": requests.Session()
+    "logged_in": False,
+    "token": None,
+    "user_id": None,
+    "role_id": None,
+    "office_id": None,
+    "username": None,
+    "password": None,
+    "selected_page": PAGES[0],
+    "table_data": None,
+    "page_num": 1,
+    "search_query": "",
+    "expanded_row": None,
+    "flash_message": None,
+    "flash_type": None,
+    "return_mode_ref": None,
+    "http_session": requests.Session(),
+
+    # NEW
+    "_clear_flash_next": False,
 }
+
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -157,38 +197,126 @@ def fetch_detail_cached(ref, token):
 # ROW ACTIONS
 # ---------------------------------------------------
 def do_transfer(ref, process_name):
+
     pn = (process_name or "").lower()
+
     if "rokka" in pn:
-        url, method = f"{BASE_URL}/pam/app/rokka/data/send/{ref}", "POST"
+        url = f"{BASE_URL}/pam/app/rokka/data/send/{ref}"
+        method = "POST"
+
     elif "fukuwa" in pn:
-        url, method = f"{BASE_URL}/pam/app/fukuwa/data/send/{ref}", "GET"
+        url = f"{BASE_URL}/pam/app/fukuwa/data/send/{ref}"
+        method = "GET"
+
     else:
-        url, method = f"{BASE_URL}/pam/app/all/data/send/{ref}", "POST"
-        
-    res = api_call(url, method=method, json={} if method == "POST" else None)
+        url = f"{BASE_URL}/pam/app/all/data/send/{ref}"
+        method = "POST"
+
+    res = api_call(
+        url,
+        method=method,
+        json={} if method == "POST" else None
+    )
+
     if res and res.ok:
+
         d = res.json()
+
         if d.get("status"):
-            st.success(f"✅ Transferred: {d.get('data', {}).get('referenceNo', 'N/A')}")
+
+            ref_no = d.get("data", {}).get("referenceNo", "N/A")
+
+            st.session_state["flash_message"] = (
+                f"✅ Transfer Successful | Ref No: {ref_no}"
+            )
+
+            st.session_state["flash_type"] = "success"
+
         else:
-            st.error(f"❌ Failed: {d.get('message', 'Unknown')}")
+
+            st.session_state["flash_message"] = (
+                f"❌ Failed: {d.get('message', 'Unknown Error')}"
+            )
+
+            st.session_state["flash_type"] = "error"
+
     else:
-        st.error(f"❌ Transfer Error: {res.status_code if res else 'No Response'}")
+
+        st.session_state["flash_message"] = (
+            f"❌ Transfer Error: {res.status_code if res else 'No Response'}"
+        )
+
+        st.session_state["flash_type"] = "error"
+
 
 def do_return(ref, remarks):
-    res = api_call(f"{BASE_URL}/pam/app/submit/deed/application/{ref}/6", json={"remarks": remarks})
+
+    url = f"{BASE_URL}/pam/app/submit/deed/application/{ref}/6"
+
+    res = api_call(
+        url,
+        json={"remarks": remarks}
+    )
+
     if res and res.ok:
+
         d = res.json()
+
         if d.get("status"):
-            st.success(f"✅ Returned successfully (ID: {d.get('data')})")
+
+            st.session_state["flash_message"] = (
+                f"✅ Returned Successfully | ID: {d.get('data')}"
+            )
+
+            st.session_state["flash_type"] = "success"
+
         else:
-            st.error(f"❌ Failed: {d.get('message', 'Unknown')}")
+
+            st.session_state["flash_message"] = (
+                f"❌ Failed: {d.get('message', 'Unknown Error')}"
+            )
+
+            st.session_state["flash_type"] = "error"
+
     else:
-        st.error(f"❌ Return Error: {res.status_code if res else 'No Response'}")
+
+        st.session_state["flash_message"] = (
+            f"❌ Return Error: {res.status_code if res else 'No Response'}"
+        )
+
+        st.session_state["flash_type"] = "error"
 
 # ---------------------------------------------------
-# UI COMPONENTS
+# FLASH MESSAGE
 # ---------------------------------------------------
+def show_flash():
+
+    msg = st.session_state.get("flash_message")
+    msg_type = st.session_state.get("flash_type", "info")
+
+    if msg:
+
+        if msg_type == "success":
+            st.success(msg)
+
+        elif msg_type == "error":
+            st.error(msg)
+
+        elif msg_type == "warning":
+            st.warning(msg)
+
+        else:
+            st.info(msg)
+
+        # Keep message visible for one full render cycle
+        if st.session_state.get("_clear_flash_next"):
+            st.session_state["flash_message"] = None
+            st.session_state["flash_type"] = None
+            st.session_state["_clear_flash_next"] = False
+
+        else:
+            st.session_state["_clear_flash_next"] = True
+
 def render_table(page_name):
     pid = PROCESS_IDS[page_name]
     is_rokka = (page_name == "Rokka/Fukuwa")
@@ -355,6 +483,20 @@ def sidebar():
     if st.sidebar.button("🚪 Logout", key="btn_logout"): st.session_state.clear(); st.rerun()
 
 def login_page():
+    st.markdown("""
+        <style>
+
+        section[data-testid="stSidebar"] {
+            display: none !important;
+        }
+
+        div[data-testid="collapsedControl"] {
+            display: none !important;
+        }
+
+        </style>
+    """, unsafe_allow_html=True)
+
     _, center, _ = st.columns([3, 1.2, 3])
     with center:
         st.title("🔐 DOLMA Login")
@@ -368,12 +510,120 @@ def login_page():
                 st.success("Login successful")
                 st.rerun()
 
+def dashboard_page():
+
+    st.title("🏛️ DOLMA Dashboard")
+
+    # Compact centered quick response section
+    left, center, right = st.columns([1.5, 2, 1.5])
+
+    with center:
+
+        st.markdown("### ⚡ Quick Response")
+
+        with st.container(border=True):
+
+            t_id = st.text_input(
+                "Reference No.",
+                max_chars=7,
+                placeholder="Enter 7-digit Reference No.",
+                key="dash_ref"
+            )
+
+            t_type = st.selectbox(
+                "Type",
+                ["Rokka", "Fukuwa", "Others"],
+                key="dash_type"
+            )
+
+            remarks = st.text_area(
+                "Remarks",
+                value="भू सेवाबाट माग भए बमोजिम फिर्ता ।",
+                height=70,
+                key="dash_remarks"
+            )
+
+            is_valid = t_id.isdigit() and len(t_id) == 7
+
+            if t_id and not is_valid:
+                st.warning("⚠️ Enter exactly 7 digits")
+
+            col1, col2 = st.columns(2)
+
+            # TRANSFER
+            if col1.button(
+                "🔄 Transfer",
+                use_container_width=True,
+                type="primary"
+            ):
+
+                if not is_valid:
+
+                    st.warning("Enter valid 7-digit ID")
+
+                else:
+
+                    do_transfer(t_id, t_type)
+                    st.rerun()
+
+            # RETURN
+            if col2.button(
+                "↩️ Return",
+                use_container_width=True
+            ):
+
+                if not is_valid:
+
+                    st.warning("Enter valid 7-digit ID")
+
+                elif not remarks.strip():
+
+                    st.warning("Remarks cannot be empty")
+
+                else:
+
+                    do_return(t_id, remarks)
+                    st.rerun()
+
+    # Placeholder for future sections
+    st.markdown("---")
+
+    st.markdown("### 📊 Upcoming Dashboard Sections")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        with st.container(border=True):
+            st.markdown("#### Pending")
+            st.caption("Future widget area")
+
+    with col2:
+        with st.container(border=True):
+            st.markdown("#### Recent Activity")
+            st.caption("Future widget area")
+
+    with col3:
+        with st.container(border=True):
+            st.markdown("#### Statistics")
+            st.caption("Future widget area")
+
 def main():
+
     if not st.session_state["logged_in"]:
         login_page()
         return
+
     sidebar()
-    render_table(st.session_state["selected_page"])
+
+    show_flash()
+
+    selected = st.session_state["selected_page"]
+
+    if selected == "Dashboard":
+        dashboard_page()
+
+    else:
+        render_table(selected)
 
 if __name__ == "__main__":
     main()
