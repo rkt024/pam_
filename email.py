@@ -1,386 +1,623 @@
-# app.py
-"""
-Minimal Streamlit app for sending daily emails to financial institutions.
-- No login system: uses static pre-assigned authorization codes in SQLite
-- Email credentials isolated in .env file (never exposed to frontend)
-- Single-file structure with strict validation and audit logging
-"""
-
-import streamlit as st
-import sqlite3
-import smtplib
 import os
 import re
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email.utils import COMMASPACE
-from email import encoders
+import ssl
+import sqlite3
+import smtplib
 from datetime import datetime
+from email.message import EmailMessage
+
+import streamlit as st
 from dotenv import load_dotenv
 
-# Load environment variables from .env file (credentials isolated)
+# =========================================================
+# PAGE CONFIG
+# =========================================================
+
+st.set_page_config(
+    page_title="Financial Email Sender",
+    page_icon="📧",
+    layout="centered"
+)
+
+# =========================================================
+# LOAD ENV
+# =========================================================
+
 load_dotenv()
 
-# Database path (SQLite file created in working directory)
-DB_PATH = "app.db"
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
-# Email regex pattern for CC validation (simple but effective for internal use)
-EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+# =========================================================
+# DATABASE
+# =========================================================
 
-# File validation constants (enforce Gmail limits)
-MAX_FILE_SIZE_MB = 10
-MAX_TOTAL_SIZE_MB = 25
-ALLOWED_EXTENSIONS = {'.pdf', '.docx'}
+DB_NAME = "app.db"
 
+conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+cursor = conn.cursor()
 
-def init_db():
-    """Initialize SQLite database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Create users table: stores staff users with static auth codes
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            auth_code TEXT NOT NULL
-        )
-    ''')
-    
-    # Create institutions table: stores financial institution contacts
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS institutions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            email TEXT NOT NULL,
-            contact TEXT
-        )
-    ''')
-    
-    # Create email_logs table: audit trail for successful sends ONLY
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS email_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            institution_id INTEGER NOT NULL,
-            ref_no TEXT NOT NULL,
-            recipients TEXT NOT NULL,
-            sent_at TEXT NOT NULL,
-            status TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (institution_id) REFERENCES institutions(id)
-        )
-    ''')
-    
-    # Insert 3 sample users with static auth codes (if not exists)
-    sample_users = [
-        ('Barun Kumar Jha', 'AUTH001'),
-        ('Jasmin Regmi', 'AUTH002'),
-        ('Rajendra Kafle', 'AUTH003'),
-        ('Raj Kumar Tamang', 'AUTH004'),
-    ]
-    for name, auth_code in sample_users:
-        cursor.execute(
-            'INSERT OR IGNORE INTO users (name, auth_code) VALUES (?, ?)',
-            (name, auth_code)
-        )
-    
-    # Insert 3 sample institutions (if not exists)
-    sample_institutions = [
-        ('Nepal Rastra Bank', 'info@nrb.org.np', "9851421542"),
-        ('Everest Bank', 'contact@everestbank.com', "9851421542"),
-        ('Himalayan Bank', 'support@himalayanbank.com', "9851421542"),
-    ]
-    for name, email, contact in sample_institutions:
-        cursor.execute(
-            'INSERT OR IGNORE INTO institutions (name, email, contact) VALUES (?, ?, ?)',
-            (name, email, contact)
-        )
-    
-    conn.commit()
-    conn.close()
+# ---------------- USERS ----------------
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    auth_code TEXT NOT NULL
+)
+""")
 
-def get_users_with_auth(conn):
-    """Fetch all users with auth codes for server-side validation (never exposed to UI)."""
-    cursor = conn.cursor()
-    cursor.execute('SELECT id, name, auth_code FROM users ORDER BY name')
-    return cursor.fetchall()
+# ---------------- INSTITUTIONS ----------------
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS institutions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL
+)
+""")
 
-def get_institutions(conn):
-    """Fetch all institutions for dropdown population."""
-    cursor = conn.cursor()
-    cursor.execute('SELECT id, name, email, contact FROM institutions ORDER BY name')
-    return cursor.fetchall()
+# ---------------- EMAIL LOGS ----------------
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS email_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_name TEXT NOT NULL,
+    institution_name TEXT NOT NULL,
+    recipients TEXT NOT NULL,
+    ref_no TEXT NOT NULL,
+    sent_at TEXT NOT NULL
+)
+""")
+
+conn.commit()
+
+# =========================================================
+# INSERT SAMPLE DATA
+# =========================================================
+# sample_users = [
+#     ("Raj Kumar Tamang", "Auth001"),
+#     ("Barun Kumar Jha", "Auth002"),
+#     ("Rajendra Kafle", "Auth003"),
+#     ("Jasmin Regmi", "Auth004")
+# ]
+
+# sample_institutions = [
+#     ("Nepal Bank", "info@nepalbank.com"),
+#     ("Nabil Bank", "support@nabilbank.com"),
+#     ("Global IME", "contact@globalimebank.com")
+# ]
+
+# for user in sample_users:
+#     cursor.execute("""
+#     INSERT OR IGNORE INTO users (name, auth_code)
+#     VALUES (?, ?)
+#     """, user)
+
+# for inst in sample_institutions:
+#     cursor.execute("""
+#     INSERT OR IGNORE INTO institutions (name, email)
+#     VALUES (?, ?)
+#     """, inst)
+
+# conn.commit()
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+
+ALLOWED_EXTENSIONS = [".pdf", ".docx"]
+
+MAX_FILE_SIZE = 10 * 1024 * 1024       # 10MB
+MAX_TOTAL_SIZE = 25 * 1024 * 1024      # 25MB
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+
+if "show_auth_popup" not in st.session_state:
+    st.session_state.show_auth_popup = False
+
+if "form_data" not in st.session_state:
+    st.session_state.form_data = {}
+
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
 
 def validate_ref_no(ref_no):
     """
-    Validate reference number: exactly 9 chars, starts with 'RK' (case-insensitive).
-    Returns: (is_valid: bool, result: str)
-    - result is uppercase validated ref_no if valid, else error message
+    Rules:
+    - Exactly 9 characters
+    - Starts with RK
     """
-    if not ref_no or not ref_no.strip():
-        return False, "Reference number is required"
-    
-    ref_clean = ref_no.strip().upper()
-    
-    if len(ref_clean) != 9:
-        return False, f"Must be exactly 9 characters (got {len(ref_clean)})"
-    
-    if not ref_clean.startswith("RK"):
-        return False, "Must start with 'RK'"
-    
-    return True, ref_clean
+
+    ref_no = ref_no.upper()
+
+    return (
+        len(ref_no) == 9
+        and ref_no.startswith("RK")
+    )
 
 
-def validate_single_email(email):
-    """Validate a single email address using regex."""
-    email = email.strip()
-    if not email:
-        return False
-    return bool(EMAIL_REGEX.match(email))
+def validate_email(email):
+
+    pattern = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+
+    return re.match(pattern, email)
 
 
-def validate_cc_emails(cc_input):
-    """
-    Validate comma-separated CC emails. Optional field.
-    Returns: (is_valid: bool, result: list or str)
-    - result is list of validated emails if valid, else error message
-    """
-    if not cc_input or not cc_input.strip():
-        return True, []  # Optional: empty is valid
-    
-    emails = []
-    for raw in cc_input.split(','):
-        email = raw.strip()
-        if email:  # Skip empty from trailing commas
-            if not validate_single_email(email):
-                return False, f"Invalid format: '{email}'"
-            emails.append(email)
-    
+def validate_cc_emails(cc_text):
+
+    if not cc_text.strip():
+        return True, []
+
+    emails = [
+        e.strip()
+        for e in cc_text.split(",")
+        if e.strip()
+    ]
+
+    for email in emails:
+
+        if not validate_email(email):
+            return False, []
+
     return True, emails
 
 
-def validate_file(uploaded_file):
-    """Validate single file: extension and size."""
-    _, ext = os.path.splitext(uploaded_file.name)
-    if ext.lower() not in ALLOWED_EXTENSIONS:
-        return False, f"Type not allowed: '{uploaded_file.name}' (only .pdf, .docx)"
-    
-    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-    if uploaded_file.size > max_bytes:
-        return False, f"Too large: '{uploaded_file.name}' (max {MAX_FILE_SIZE_MB}MB)"
-    
-    return True, None
+def validate_files(uploaded_files):
+
+    total_size = 0
+
+    for file in uploaded_files:
+
+        ext = os.path.splitext(
+            file.name
+        )[1].lower()
+
+        if ext not in ALLOWED_EXTENSIONS:
+            return (
+                False,
+                f"Invalid file type: {file.name}"
+            )
+
+        if file.size > MAX_FILE_SIZE:
+            return (
+                False,
+                f"{file.name} exceeds 10MB limit"
+            )
+
+        total_size += file.size
+
+    if total_size > MAX_TOTAL_SIZE:
+        return (
+            False,
+            "Total attachment size exceeds 25MB"
+        )
+
+    return True, ""
 
 
-def validate_files(files):
-    """Validate file list: individual checks + total size limit."""
-    if not files:
-        return False, "At least one file required"
-    
-    total_bytes = 0
-    for f in files:
-        valid, err = validate_file(f)
-        if not valid:
-            return False, err
-        total_bytes += f.size
-    
-    max_total = MAX_TOTAL_SIZE_MB * 1024 * 1024
-    if total_bytes > max_total:
-        return False, f"Total size ({total_bytes/1024/1024:.1f}MB) exceeds {MAX_TOTAL_SIZE_MB}MB limit"
-    
-    return True, None
+def get_users():
+
+    cursor.execute("""
+    SELECT name
+    FROM users
+    ORDER BY name
+    """)
+
+    return [row[0] for row in cursor.fetchall()]
 
 
-def send_email_via_gmail(institution_email, cc_emails, files, ref_no):
-    """
-    Send email via Gmail SMTP (SSL, port 465).
-    - Credentials loaded from .env via os.getenv (never printed/exposed)
-    - Fixed subject: "रोक्का जानकारी", empty body
-    - msg['To']/msg['Cc'] as strings; sendmail() recipients as list
-    """
-    gmail_user = os.getenv('GMAIL_USER')
-    gmail_pass = os.getenv('GMAIL_APP_PASSWORD')
-    
-    if not gmail_user or not gmail_pass:
-        raise RuntimeError("Email credentials missing. Check .env file.")
-    
-    # Build MIME message
-    msg = MIMEMultipart()
-    msg['From'] = gmail_user
-    msg['To'] = institution_email  # String for header
-    msg['Subject'] = "रोक्का जानकारी"
-    
-    if cc_emails:
-        msg['Cc'] = COMMASPACE.join(cc_emails)  # String for header
-    
-    msg.attach(MIMEText('', 'plain'))  # Empty body per spec
-    
-    # Attach files (preserve original filenames)
-    for f in files:
-        f.seek(0)  # Reset pointer
-        part = MIMEBase('application', 'octet-stream')
-        part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename="{f.name}"')
-        msg.attach(part)
-    
-    # sendmail() requires list of ALL recipients (To + CC)
-    recipients_list = [institution_email] + cc_emails
-    
-    # Send via SMTP SSL
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-        server.login(gmail_user, gmail_pass)
-        server.sendmail(gmail_user, recipients_list, msg.as_string())
+def get_institutions():
+
+    cursor.execute("""
+    SELECT name, email
+    FROM institutions
+    ORDER BY name
+    """)
+
+    return cursor.fetchall()
 
 
-def log_success(conn, user_id, inst_id, ref_no, recipients_str, sent_at):
-    """Log successful send to email_logs (only successes logged per requirements)."""
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO email_logs (user_id, institution_id, ref_no, recipients, sent_at, status)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user_id, inst_id, ref_no, recipients_str, sent_at, 'sent'))
+def verify_auth_code(user_name, auth_code):
+
+    cursor.execute("""
+    SELECT auth_code
+    FROM users
+    WHERE name = ?
+    """, (user_name,))
+
+    result = cursor.fetchone()
+
+    if not result:
+        return False
+
+    return auth_code == result[0]
+
+
+def send_email(
+    to_email,
+    cc_list,
+    uploaded_files
+):
+
+    msg = EmailMessage()
+
+    msg["Subject"] = "रोक्का जानकारी"
+
+    msg["From"] = GMAIL_USER
+
+    msg["To"] = to_email
+
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+
+    msg.set_content("")
+
+    # ---------------- ATTACH FILES ----------------
+
+    for file in uploaded_files:
+
+        file_data = file.read()
+
+        ext = os.path.splitext(
+            file.name
+        )[1].lower()
+
+        if ext == ".pdf":
+
+            maintype = "application"
+            subtype = "pdf"
+
+        elif ext == ".docx":
+
+            maintype = "application"
+
+            subtype = (
+                "vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+
+        else:
+            continue
+
+        msg.add_attachment(
+            file_data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=file.name
+        )
+
+    recipients = [to_email] + cc_list
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465,
+        context=context
+    ) as server:
+
+        server.login(
+            GMAIL_USER,
+            GMAIL_APP_PASSWORD
+        )
+
+        server.send_message(
+            msg,
+            from_addr=GMAIL_USER,
+            to_addrs=recipients
+        )
+
+
+def log_email(
+    user_name,
+    institution_name,
+    recipients,
+    ref_no
+):
+
+    cursor.execute("""
+    INSERT INTO email_logs (
+        user_name,
+        institution_name,
+        recipients,
+        ref_no,
+        sent_at
+    )
+    VALUES (?, ?, ?, ?, ?)
+    """, (
+        user_name,
+        institution_name,
+        recipients,
+        ref_no,
+        datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    ))
+
     conn.commit()
 
+# =========================================================
+# UI
+# =========================================================
 
-def main():
-    """Main Streamlit app entry point."""
-    st.set_page_config(page_title="Daily Email Sender", page_icon="📧", layout="centered")
-    st.title("📧 Daily Email Sender")
-    st.caption("Internal tool for financial institution communications")
-    
-    # Initialize DB with tables + sample data
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    
-    # Fetch data for dropdowns
-    users_data = get_users_with_auth(conn)  # [(id, name, auth_code), ...]
-    inst_data = get_institutions(conn)       # [(id, name, email, contact), ...]
-    
-    # Build lookup dicts (auth_code used server-side only, never exposed)
-    user_lookup = {name: {'id': uid, 'auth': auth} for uid, name, auth in users_data}
-    inst_lookup = {name: {'id': iid, 'email': email} for iid, name, email, _ in inst_data}
-    
-    # Use st.form to prevent duplicate sends on Streamlit reruns
-    with st.form("email_form", clear_on_submit=False):
-        st.subheader("Compose Email")
-        
-        # Field 1: Select User
-        sel_user = st.selectbox("Select User", [n for _, n, _ in users_data], 
-                               index=None, placeholder="👤 Choose your name...")
-        
-        # Field 2: Select Institution
-        sel_inst = st.selectbox("Select Institution", [n for _, n, _, _ in inst_data],
-                               index=None, placeholder="🏦 Choose recipient...")
-        
-        # Field 3: CC Emails (optional)
-        cc_input = st.text_input("CC Emails (optional)", 
-                                placeholder="manager@bank.com, auditor@firm.org",
-                                help="Comma-separated; each validated individually")
-        
-        # Field 4: Reference Number (strict: 9 chars, starts with RK)
-        ref_input = st.text_input("Reference Number", placeholder="RK1234567",
-                                 help="Exactly 9 characters, must start with 'RK'")
-        
-        # Field 5: Authorization Code (static, per-user, masked input)
-        auth_input = st.text_input("Authorization Code", type="password",
-                                  placeholder="Enter your pre-assigned code",
-                                  help="Static code assigned to your account")
-        
-        # Field 6: File Upload (multiple, type/size validated)
-        files = st.file_uploader("Attach Documents", type=['pdf', 'docx'],
-                                accept_multiple_files=True,
-                                help=f"Max {MAX_FILE_SIZE_MB}MB/file, total <{MAX_TOTAL_SIZE_MB}MB")
-        
-        # Submit Button
-        submitted = st.form_submit_button("📤 Send Email")
-        
-        if submitted:
-            # === VALIDATION PIPELINE ===
-            
-            # 1. Required selections
-            if not sel_user or not sel_inst:
-                st.error("❌ Select both user and institution")
-            elif not files:
-                st.error("❌ Attach at least one document")
-            else:
-                # 2. Validate ref_no
-                ref_ok, ref_res = validate_ref_no(ref_input)
-                if not ref_ok:
-                    st.error(f"❌ Reference: {ref_res}")
-                else:
-                    ref_val = ref_res  # Uppercase validated
-                    
-                    # 3. Validate CC emails
-                    cc_ok, cc_res = validate_cc_emails(cc_input)
-                    if not cc_ok:
-                        st.error(f"❌ CC Emails: {cc_res}")
-                    else:
-                        cc_val = cc_res  # List of validated emails
-                        
-                        # 4. Verify auth code (server-side, never exposed)
-                        user_info = user_lookup.get(sel_user)
-                        if not user_info or auth_input != user_info['auth']:
-                            st.error("❌ Authorization code mismatch")
-                        else:
-                            # 5. Validate files
-                            files_ok, files_err = validate_files(files)
-                            if not files_ok:
-                                st.error(f"❌ Attachments: {files_err}")
-                            else:
-                                # === ALL VALIDATIONS PASSED: SEND EMAIL ===
-                                try:
-                                    inst_info = inst_lookup[sel_inst]
-                                    to_email = inst_info['email']
-                                    
-                                    # Send via Gmail SMTP
-                                    send_email_via_gmail(
-                                        institution_email=to_email,
-                                        cc_emails=cc_val,
-                                        files=files,
-                                        ref_no=ref_val
-                                    )
-                                    
-                                    # Log success (only successful sends logged)
-                                    sent_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                    all_recipients = [to_email] + cc_val
-                                    recipients_log = COMMASPACE.join(all_recipients)
-                                    
-                                    log_success(
-                                        conn=conn,
-                                        user_id=user_info['id'],
-                                        inst_id=inst_info['id'],
-                                        ref_no=ref_val,
-                                        recipients_str=recipients_log,
-                                        sent_at=sent_ts
-                                    )
-                                    
-                                    st.success(f"✅ Sent! Ref: {ref_val}")
-                                    st.info(f"📬 To: {to_email}" + 
-                                           (f" | CC: {', '.join(cc_val)}" if cc_val else ""))
-                                    
-                                except RuntimeError as e:
-                                    st.error(f"❌ Config Error: {e}")
-                                except smtplib.SMTPAuthenticationError:
-                                    st.error("❌ Auth failed. Check GMAIL_APP_PASSWORD in .env")
-                                except smtplib.SMTPException as e:
-                                    st.error(f"❌ SMTP Error: {e}")
-                                except ConnectionError:
-                                    st.error("❌ Network error. Check internet connection")
-                                except Exception:
-                                    st.error("❌ Unexpected error. Please retry or contact support")
-    
-    conn.close()
-    
-    # Footer security note
-    st.markdown("---")
-    st.caption("🔐 Credentials from .env only. Never logged or exposed. Gmail App Password required.")
+st.title("📧 Daily Email Sender")
+
+users = get_users()
+
+institutions = get_institutions()
+
+institution_names = [
+    inst[0]
+    for inst in institutions
+]
+
+institution_email_map = {
+    name: email
+    for name, email in institutions
+}
 
 
-if __name__ == "__main__":
-    main()
+st.sidebar.title("User")
+
+selected_user = st.sidebar.selectbox(
+    "Select User",
+    users
+)
+
+# =========================================================
+# MAIN FORM
+# =========================================================
+
+with st.form("email_form"):
+
+    uploaded_files = st.file_uploader(
+        "Upload Documents (.pdf, .docx)",
+        type=["pdf", "docx"],
+        accept_multiple_files=True
+    )
+
+    selected_institution = st.selectbox(
+        "Select Institution",
+        institution_names
+    )
+
+    cc_emails = st.text_input(
+        "CC Emails (optional)",
+        placeholder="manager@bank.com, auditor@firm.org"
+    )
+
+    ref_no = st.text_input(
+        "Reference Number",
+        placeholder="RK1234567"
+    ).upper()
+
+    submitted = st.form_submit_button(
+        "Send Email"
+    )
+
+# =========================================================
+# FORM VALIDATION
+# =========================================================
+
+if submitted:
+
+    # ---------------- ENV CHECK ----------------
+
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+
+        st.error(
+            "Email credentials missing in .env"
+        )
+
+        st.stop()
+
+    # ---------------- REF VALIDATION ----------------
+
+    if not validate_ref_no(ref_no):
+
+        st.error(
+            "Reference Number must:\n"
+            "- Start with RK\n"
+            "- Be exactly 9 characters"
+        )
+
+        st.stop()
+
+    # ---------------- FILE CHECK ----------------
+
+    if not uploaded_files:
+
+        st.error(
+            "Please upload at least one file."
+        )
+
+        st.stop()
+
+    files_valid, file_error = validate_files(
+        uploaded_files
+    )
+
+    if not files_valid:
+
+        st.error(file_error)
+
+        st.stop()
+
+    # ---------------- CC VALIDATION ----------------
+
+    cc_valid, cc_list = validate_cc_emails(
+        cc_emails
+    )
+
+    if not cc_valid:
+
+        st.error(
+            "Invalid CC email format."
+        )
+
+        st.stop()
+
+    # ---------------- SAVE FORM DATA ----------------
+
+    st.session_state.form_data = {
+
+        "selected_user": selected_user,
+
+        "uploaded_files": uploaded_files,
+
+        "selected_institution": selected_institution,
+
+        "cc_list": cc_list,
+
+        "ref_no": ref_no
+    }
+
+    # OPEN POPUP
+
+    st.session_state.show_auth_popup = True
+
+    st.rerun()
+
+# =========================================================
+# AUTH POPUP
+# =========================================================
+
+@st.dialog("Authorization Required")
+def auth_popup():
+
+    st.write(
+        "Enter authorization code to send email."
+    )
+
+    auth_code = st.text_input(
+        "Authorization Code",
+        type="password"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        send_btn = st.button(
+            "Confirm & Send",
+            use_container_width=True
+        )
+
+    with col2:
+
+        cancel_btn = st.button(
+            "Cancel",
+            use_container_width=True
+        )
+
+    # ---------------- CANCEL ----------------
+
+    if cancel_btn:
+
+        st.session_state.show_auth_popup = False
+
+        st.rerun()
+
+    # ---------------- SEND ----------------
+
+    if send_btn:
+
+        data = st.session_state.form_data
+
+        selected_user = data["selected_user"]
+
+        uploaded_files = data["uploaded_files"]
+
+        selected_institution = data[
+            "selected_institution"
+        ]
+
+        cc_list = data["cc_list"]
+
+        ref_no = data["ref_no"]
+
+        # ------------ VERIFY AUTH ------------
+
+        if not verify_auth_code(
+            selected_user,
+            auth_code
+        ):
+
+            st.error(
+                "Invalid authorization code."
+            )
+
+            return
+
+        try:
+
+            to_email = institution_email_map[
+                selected_institution
+            ]
+
+            send_email(
+                to_email=to_email,
+                cc_list=cc_list,
+                uploaded_files=uploaded_files
+            )
+
+            # RECIPIENTS
+
+            all_recipients = (
+                [to_email] + cc_list
+            )
+
+            recipients_str = ", ".join(
+                all_recipients
+            )
+
+            # LOG SUCCESS
+
+            log_email(
+                user_name=selected_user,
+                institution_name=selected_institution,
+                recipients=recipients_str,
+                ref_no=ref_no
+            )
+
+            # RESET STATE
+
+            st.session_state.show_auth_popup = False
+
+            st.session_state.form_data = {}
+
+            st.success(
+                "✅ Email sent successfully."
+            )
+
+            st.rerun()
+
+        except smtplib.SMTPAuthenticationError:
+
+            st.error(
+                "SMTP Authentication failed. "
+                "Check Gmail App Password."
+            )
+
+        except smtplib.SMTPException as e:
+
+            st.error(
+                f"SMTP Error: {str(e)}"
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"Unexpected Error: {str(e)}"
+            )
+
+# =========================================================
+# SHOW POPUP
+# =========================================================
+
+if st.session_state.show_auth_popup:
+
+    auth_popup()
