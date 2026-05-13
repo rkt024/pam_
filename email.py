@@ -6,6 +6,7 @@ import smtplib
 from datetime import datetime
 from email.message import EmailMessage
 
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -16,7 +17,7 @@ from dotenv import load_dotenv
 st.set_page_config(
     page_title="Financial Email Sender",
     page_icon="📧",
-    layout="centered"
+    layout="wide"
 )
 
 # =========================================================
@@ -73,43 +74,13 @@ CREATE TABLE IF NOT EXISTS email_logs (
 conn.commit()
 
 # =========================================================
-# INSERT SAMPLE DATA
-# =========================================================
-# sample_users = [
-#     ("Raj Kumar Tamang", "Auth001"),
-#     ("Barun Kumar Jha", "Auth002"),
-#     ("Rajendra Kafle", "Auth003"),
-#     ("Jasmin Regmi", "Auth004")
-# ]
-
-# sample_institutions = [
-#     ("Nepal Bank", "info@nepalbank.com"),
-#     ("Nabil Bank", "support@nabilbank.com"),
-#     ("Global IME", "contact@globalimebank.com")
-# ]
-
-# for user in sample_users:
-#     cursor.execute("""
-#     INSERT OR IGNORE INTO users (name, auth_code)
-#     VALUES (?, ?)
-#     """, user)
-
-# for inst in sample_institutions:
-#     cursor.execute("""
-#     INSERT OR IGNORE INTO institutions (name, email)
-#     VALUES (?, ?)
-#     """, inst)
-
-# conn.commit()
-
-# =========================================================
 # CONSTANTS
 # =========================================================
 
 ALLOWED_EXTENSIONS = [".pdf", ".docx"]
 
-MAX_FILE_SIZE = 10 * 1024 * 1024       # 10MB
-MAX_TOTAL_SIZE = 25 * 1024 * 1024      # 25MB
+MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_TOTAL_SIZE = 25 * 1024 * 1024
 
 # =========================================================
 # SESSION STATE
@@ -121,16 +92,14 @@ if "show_auth_popup" not in st.session_state:
 if "form_data" not in st.session_state:
     st.session_state.form_data = {}
 
+if "sending_email" not in st.session_state:
+    st.session_state.sending_email = False
+
 # =========================================================
 # HELPER FUNCTIONS
 # =========================================================
 
 def validate_ref_no(ref_no):
-    """
-    Rules:
-    - Exactly 9 characters
-    - Starts with RK
-    """
 
     ref_no = ref_no.upper()
 
@@ -172,9 +141,7 @@ def validate_files(uploaded_files):
 
     for file in uploaded_files:
 
-        ext = os.path.splitext(
-            file.name
-        )[1].lower()
+        ext = os.path.splitext(file.name)[1].lower()
 
         if ext not in ALLOWED_EXTENSIONS:
             return (
@@ -256,15 +223,14 @@ def send_email(
 
     msg.set_content("")
 
-    # ---------------- ATTACH FILES ----------------
+    # ATTACH FILES
 
     for file in uploaded_files:
 
-        file_data = file.read()
+        file_name = file["name"]
+        file_data = file["data"]
 
-        ext = os.path.splitext(
-            file.name
-        )[1].lower()
+        ext = os.path.splitext(file_name)[1].lower()
 
         if ext == ".pdf":
 
@@ -286,7 +252,7 @@ def send_email(
             file_data,
             maintype=maintype,
             subtype=subtype,
-            filename=file.name
+            filename=file_name
         )
 
     recipients = [to_email] + cc_list
@@ -339,11 +305,26 @@ def log_email(
 
     conn.commit()
 
+
+def get_email_logs():
+
+    query = """
+    SELECT
+        id,
+        user_name,
+        institution_name,
+        recipients,
+        ref_no,
+        sent_at
+    FROM email_logs
+    ORDER BY datetime(sent_at) DESC
+    """
+
+    return pd.read_sql_query(query, conn)
+
 # =========================================================
 # UI
 # =========================================================
-
-st.title("📧 Daily Email Sender")
 
 users = get_users()
 
@@ -359,8 +340,23 @@ institution_email_map = {
     for name, email in institutions
 }
 
+# =========================================================
+# SIDEBAR
+# =========================================================
 
-st.sidebar.title("User")
+st.sidebar.title("📂 Navigation")
+
+menu = st.sidebar.radio(
+    "Go To",
+    [
+        "Send Email",
+        "Email Logs Dashboard"
+    ]
+)
+
+st.sidebar.divider()
+
+st.sidebar.title("👤 User")
 
 selected_user = st.sidebar.selectbox(
     "Select User",
@@ -368,162 +364,201 @@ selected_user = st.sidebar.selectbox(
 )
 
 # =========================================================
-# MAIN FORM
+# SEND EMAIL PAGE
 # =========================================================
 
-with st.form("email_form"):
+if menu == "Send Email":
 
-    uploaded_files = st.file_uploader(
-        "Upload Documents (.pdf, .docx)",
-        type=["pdf", "docx"],
-        accept_multiple_files=True
-    )
+    st.title("📧 Daily Email Sender")
 
-    selected_institution = st.selectbox(
-        "Select Institution",
-        institution_names
-    )
+    with st.form("email_form"):
 
-    cc_emails = st.text_input(
-        "CC Emails (optional)",
-        placeholder="manager@bank.com, auditor@firm.org"
-    )
-
-    ref_no = st.text_input(
-        "Reference Number",
-        placeholder="RK1234567"
-    ).upper()
-
-    submitted = st.form_submit_button(
-        "Send Email"
-    )
-
-# =========================================================
-# FORM VALIDATION
-# =========================================================
-
-if submitted:
-
-    # ---------------- ENV CHECK ----------------
-
-    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-
-        st.error(
-            "Email credentials missing in .env"
+        uploaded_files = st.file_uploader(
+            "Upload Documents (.pdf, .docx)",
+            type=["pdf", "docx"],
+            accept_multiple_files=True
         )
 
-        st.stop()
-
-    # ---------------- REF VALIDATION ----------------
-
-    if not validate_ref_no(ref_no):
-
-        st.error(
-            "Reference Number must:\n"
-            "- Start with RK\n"
-            "- Be exactly 9 characters"
+        selected_institution = st.selectbox(
+            "Select Institution",
+            institution_names
         )
 
-        st.stop()
-
-    # ---------------- FILE CHECK ----------------
-
-    if not uploaded_files:
-
-        st.error(
-            "Please upload at least one file."
+        cc_emails = st.text_input(
+            "CC Emails (optional)",
+            placeholder="manager@bank.com, auditor@firm.org"
         )
 
-        st.stop()
+        ref_no = st.text_input(
+            "Reference Number",
+            placeholder="RK1234567"
+        ).upper()
 
-    files_valid, file_error = validate_files(
-        uploaded_files
-    )
-
-    if not files_valid:
-
-        st.error(file_error)
-
-        st.stop()
-
-    # ---------------- CC VALIDATION ----------------
-
-    cc_valid, cc_list = validate_cc_emails(
-        cc_emails
-    )
-
-    if not cc_valid:
-
-        st.error(
-            "Invalid CC email format."
+        submitted = st.form_submit_button(
+            "Send Email"
         )
 
-        st.stop()
+    # =====================================================
+    # FORM VALIDATION
+    # =====================================================
 
-    # ---------------- SAVE FORM DATA ----------------
+    if submitted:
 
-    st.session_state.form_data = {
+        if not GMAIL_USER or not GMAIL_APP_PASSWORD:
 
-        "selected_user": selected_user,
+            st.error(
+                "Email credentials missing in .env"
+            )
 
-        "uploaded_files": uploaded_files,
+            st.stop()
 
-        "selected_institution": selected_institution,
+        if not validate_ref_no(ref_no):
 
-        "cc_list": cc_list,
+            st.error(
+                "Reference Number must:\n"
+                "- Start with RK\n"
+                "- Be exactly 9 characters"
+            )
 
-        "ref_no": ref_no
-    }
+            st.stop()
 
-    # OPEN POPUP
+        if not uploaded_files:
 
-    st.session_state.show_auth_popup = True
+            st.error(
+                "Please upload at least one file."
+            )
 
-    st.rerun()
+            st.stop()
 
-# =========================================================
-# AUTH POPUP
-# =========================================================
-
-@st.dialog("Authorization Required")
-def auth_popup():
-
-    st.write(
-        "Enter authorization code to send email."
-    )
-
-    auth_code = st.text_input(
-        "Authorization Code",
-        type="password"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        send_btn = st.button(
-            "Confirm & Send",
-            use_container_width=True
+        files_valid, file_error = validate_files(
+            uploaded_files
         )
 
-    with col2:
+        if not files_valid:
 
-        cancel_btn = st.button(
-            "Cancel",
-            use_container_width=True
+            st.error(file_error)
+
+            st.stop()
+
+        cc_valid, cc_list = validate_cc_emails(
+            cc_emails
         )
 
-    # ---------------- CANCEL ----------------
+        if not cc_valid:
 
-    if cancel_btn:
+            st.error(
+                "Invalid CC email format."
+            )
 
-        st.session_state.show_auth_popup = False
+            st.stop()
+
+        # SAVE FILES
+
+        saved_files = []
+
+        for file in uploaded_files:
+
+            saved_files.append({
+                "name": file.name,
+                "type": file.type,
+                "data": file.getvalue()
+            })
+
+        st.session_state.form_data = {
+
+            "selected_user": selected_user,
+
+            "uploaded_files": saved_files,
+
+            "selected_institution": selected_institution,
+
+            "cc_list": cc_list,
+
+            "ref_no": ref_no
+        }
+
+        st.session_state.show_auth_popup = True
 
         st.rerun()
 
-    # ---------------- SEND ----------------
+    # =====================================================
+    # AUTH POPUP
+    # =====================================================
 
-    if send_btn:
+    @st.dialog("Authorization Required")
+    def auth_popup():
+
+        st.write(
+            "Enter authorization code to send email."
+        )
+
+        auth_code = st.text_input(
+            "Authorization Code",
+            type="password"
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            send_btn = st.button(
+                "Confirm & Send",
+                use_container_width=True
+            )
+
+        with col2:
+
+            cancel_btn = st.button(
+                "Cancel",
+                use_container_width=True
+            )
+
+        # CANCEL
+
+        if cancel_btn:
+
+            st.session_state.show_auth_popup = False
+
+            st.rerun()
+
+        # SEND
+
+        if send_btn:
+
+            data = st.session_state.form_data
+
+            selected_user = data["selected_user"]
+
+            if not verify_auth_code(
+                selected_user,
+                auth_code
+            ):
+
+                st.error(
+                    "Invalid authorization code."
+                )
+
+                return
+
+            st.session_state.show_auth_popup = False
+
+            st.session_state.sending_email = True
+
+            st.rerun()
+
+    # =====================================================
+    # SHOW POPUP
+    # =====================================================
+
+    if st.session_state.show_auth_popup:
+
+        auth_popup()
+
+    # =====================================================
+    # SEND EMAIL PROCESS
+    # =====================================================
+
+    if st.session_state.sending_email:
 
         data = st.session_state.form_data
 
@@ -539,85 +574,267 @@ def auth_popup():
 
         ref_no = data["ref_no"]
 
-        # ------------ VERIFY AUTH ------------
+        to_email = institution_email_map[
+            selected_institution
+        ]
 
-        if not verify_auth_code(
-            selected_user,
-            auth_code
-        ):
+        with st.spinner("Sending email..."):
 
-            st.error(
-                "Invalid authorization code."
-            )
+            try:
 
-            return
+                send_email(
+                    to_email=to_email,
+                    cc_list=cc_list,
+                    uploaded_files=uploaded_files
+                )
 
-        try:
+                all_recipients = (
+                    [to_email] + cc_list
+                )
 
-            to_email = institution_email_map[
-                selected_institution
-            ]
+                recipients_str = ", ".join(
+                    all_recipients
+                )
 
-            send_email(
-                to_email=to_email,
-                cc_list=cc_list,
-                uploaded_files=uploaded_files
-            )
+                log_email(
+                    user_name=selected_user,
+                    institution_name=selected_institution,
+                    recipients=recipients_str,
+                    ref_no=ref_no
+                )
 
-            # RECIPIENTS
+                st.success(
+                    "✅ Email sent successfully."
+                )
 
-            all_recipients = (
-                [to_email] + cc_list
-            )
+                st.toast(
+                    "Email delivered successfully."
+                )
 
-            recipients_str = ", ".join(
-                all_recipients
-            )
+                st.balloons()
 
-            # LOG SUCCESS
+            except smtplib.SMTPAuthenticationError:
 
-            log_email(
-                user_name=selected_user,
-                institution_name=selected_institution,
-                recipients=recipients_str,
-                ref_no=ref_no
-            )
+                st.error(
+                    "SMTP Authentication failed."
+                )
 
-            # RESET STATE
+            except smtplib.SMTPException as e:
 
-            st.session_state.show_auth_popup = False
+                st.error(
+                    f"SMTP Error: {str(e)}"
+                )
 
-            st.session_state.form_data = {}
+            except Exception as e:
 
-            st.success(
-                "✅ Email sent successfully."
-            )
+                st.exception(e)
 
-            st.rerun()
+        # RESET STATES
 
-        except smtplib.SMTPAuthenticationError:
+        st.session_state.sending_email = False
 
-            st.error(
-                "SMTP Authentication failed. "
-                "Check Gmail App Password."
-            )
-
-        except smtplib.SMTPException as e:
-
-            st.error(
-                f"SMTP Error: {str(e)}"
-            )
-
-        except Exception as e:
-
-            st.error(
-                f"Unexpected Error: {str(e)}"
-            )
+        st.session_state.form_data = {}
 
 # =========================================================
-# SHOW POPUP
+# EMAIL LOGS DASHBOARD
 # =========================================================
 
-if st.session_state.show_auth_popup:
+if menu == "Email Logs Dashboard":
 
-    auth_popup()
+    st.title("📊 Email Logs Dashboard")
+
+    df = get_email_logs()
+
+    if df.empty:
+
+        st.warning("No email logs found.")
+
+        st.stop()
+
+    # =====================================================
+    # DATE CONVERSION
+    # =====================================================
+
+    df["sent_at"] = pd.to_datetime(df["sent_at"])
+
+    df["date"] = df["sent_at"].dt.date
+
+    # =====================================================
+    # FILTERS
+    # =====================================================
+
+    st.sidebar.subheader("🔍 Filters")
+
+    bank_filter = st.sidebar.selectbox(
+        "Bank Name",
+        ["All"] + sorted(
+            df["institution_name"].unique().tolist()
+        )
+    )
+
+    user_filter = st.sidebar.selectbox(
+        "User",
+        ["All"] + sorted(
+            df["user_name"].unique().tolist()
+        )
+    )
+
+    ref_filter = st.sidebar.text_input(
+        "Reference Number",
+        placeholder="RK1234567"
+    )
+
+    date_range = st.sidebar.date_input(
+        "Date Range",
+        []
+    )
+
+    filtered_df = df.copy()
+
+    # =====================================================
+    # APPLY FILTERS
+    # =====================================================
+
+    if bank_filter != "All":
+
+        filtered_df = filtered_df[
+            filtered_df["institution_name"]
+            == bank_filter
+        ]
+
+    if user_filter != "All":
+
+        filtered_df = filtered_df[
+            filtered_df["user_name"]
+            == user_filter
+        ]
+
+    if ref_filter.strip():
+
+        filtered_df = filtered_df[
+            filtered_df["ref_no"]
+            .str.contains(
+                ref_filter.strip(),
+                case=False,
+                na=False
+            )
+        ]
+
+    if len(date_range) == 2:
+
+        start_date, end_date = date_range
+
+        filtered_df = filtered_df[
+            (filtered_df["date"] >= start_date)
+            &
+            (filtered_df["date"] <= end_date)
+        ]
+
+    # =====================================================
+    # METRICS
+    # =====================================================
+
+    total_emails = len(filtered_df)
+
+    total_banks = filtered_df[
+        "institution_name"
+    ].nunique()
+
+    total_users = filtered_df[
+        "user_name"
+    ].nunique()
+
+    latest_email = filtered_df[
+        "sent_at"
+    ].max()
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric(
+            "Total Emails",
+            total_emails
+        )
+
+    with col2:
+        st.metric(
+            "Banks",
+            total_banks
+        )
+
+    with col3:
+        st.metric(
+            "Users",
+            total_users
+        )
+
+    with col4:
+        st.metric(
+            "Latest Email",
+            latest_email.strftime("%Y-%m-%d")
+            if pd.notnull(latest_email)
+            else "N/A"
+        )
+
+    st.divider()
+
+    # =====================================================
+    # CHARTS
+    # =====================================================
+
+    st.subheader("📈 Emails by Bank")
+
+    bank_chart = filtered_df[
+        "institution_name"
+    ].value_counts()
+
+    st.bar_chart(bank_chart)
+
+    st.subheader("📈 Emails by User")
+
+    user_chart = filtered_df[
+        "user_name"
+    ].value_counts()
+
+    st.bar_chart(user_chart)
+
+    st.subheader("📈 Emails Per Day")
+
+    daily_chart = filtered_df.groupby(
+        filtered_df["sent_at"].dt.date
+    ).size()
+
+    st.line_chart(daily_chart)
+
+    st.divider()
+
+    # =====================================================
+    # LOG TABLE
+    # =====================================================
+
+    st.subheader("📋 Email Logs")
+
+    display_df = filtered_df.copy()
+
+    display_df["sent_at"] = display_df[
+        "sent_at"
+    ].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # =====================================================
+    # DOWNLOAD CSV
+    # =====================================================
+
+    csv = display_df.to_csv(index=False)
+
+    st.download_button(
+        label="⬇ Download CSV",
+        data=csv,
+        file_name="email_logs.csv",
+        mime="text/csv"
+    )
