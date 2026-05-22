@@ -1,629 +1,432 @@
-import streamlit as st
-import requests
+import os
+import re
+import ssl
+import sqlite3
+import smtplib
+from datetime import datetime
+from email.message import EmailMessage
+
 import pandas as pd
-import urllib3
-import math
+import streamlit as st
 from dotenv import load_dotenv
 
-# ---------------------------------------------------
-# CONFIG
-# ---------------------------------------------------
-load_dotenv()
-VERIFY_SSL = False
-if not VERIFY_SSL:
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# =========================================================
+# CONSTANTS
+# =========================================================
 
-BASE_URL = "https://public.dolma.gov.np"
-BASE_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0",
-    "Origin": BASE_URL,
-    "Referer": f"{BASE_URL}/dolma/",
-    "user-type": "3"
-}
+DB_NAME = "app.db"
+ALLOWED_EXTENSIONS = [".pdf", ".docx"]
+MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_TOTAL_SIZE = 25 * 1024 * 1024
 
-PAGES = [
-    "Dashboard",
-    "Likhat Parit",
-    "Jagga Darta",
-    "Namsari",
-    "Dakhil Kharej",
-    "Samsodan",
-    "Halsabik",
-    "Rokka/Fukuwa",
-    "Apartment",
-    "Pratilipi",
-    "Guthi Adhinastha"
-]
+# =========================================================
+# DATABASE & INITIALIZATION
+# =========================================================
 
-PROCESS_IDS = {
-    "Likhat Parit": "1", "Jagga Darta": "2", "Namsari": "3", "Dakhil Kharej": "4",
-    "Samsodan": "5", "Halsabik": "7", "Rokka/Fukuwa": "8,15", "Apartment": "16",
-    "Pratilipi": "21", "Guthi Adhinastha": "22"
-}
+def init_db():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    cursor = conn.cursor()
 
-ROWS_PER_PAGE = 7
+    # ---------------- USERS ----------------
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        auth_code TEXT NOT NULL
+    )
+    """)
 
-st.markdown("""
-<style>
+    # ---------------- INSTITUTIONS ----------------
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS institutions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        email TEXT NOT NULL
+    )
+    """)
 
-/* Hide top multipage navigation */
-[data-testid="stSidebarNav"] {
-    display: none;
-}
+    # ---------------- EMAIL LOGS ----------------
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS email_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_name TEXT NOT NULL,
+        institution_name TEXT NOT NULL,
+        recipients TEXT NOT NULL,
+        ref_no TEXT NOT NULL,
+        sent_at TEXT NOT NULL
+    )
+    """)
 
-/* Optional: remove extra top spacing */
-[data-testid="stSidebarContent"] {
-    padding-top: 1rem;
-}
+    conn.commit()
+    return conn
 
-</style>
-""", unsafe_allow_html=True)
+def init_session_state():
+    if "show_auth_popup" not in st.session_state:
+        st.session_state.show_auth_popup = False
+    if "form_data" not in st.session_state:
+        st.session_state.form_data = {}
+    if "sending_email" not in st.session_state:
+        st.session_state.sending_email = False
 
-st.set_page_config(page_title="DOLMA Office Portal", page_icon="🏛️", layout="wide")
+# =========================================================
+# DATABASE QUERIES
+# =========================================================
 
-# ---------------------------------------------------
-# SESSION STATE INIT
-# ---------------------------------------------------
-defaults = {
-    "logged_in": False,
-    "token": None,
-    "user_id": None,
-    "role_id": None,
-    "office_id": None,
-    "username": None,
-    "password": None,
-    "selected_page": PAGES[0],
-    "table_data": None,
-    "page_num": 1,
-    "search_query": "",
-    "expanded_row": None,
-    "flash_message": None,
-    "flash_type": None,
-    "return_mode_ref": None,
-    "http_session": requests.Session(),
+def get_users(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM users ORDER BY name")
+    return [row[0] for row in cursor.fetchall()]
 
-    # NEW
-    "_clear_flash_next": False,
-}
+def get_institutions(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, email FROM institutions ORDER BY name")
+    return cursor.fetchall()
 
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-session = st.session_state["http_session"]
-
-# ---------------------------------------------------
-# API CLIENT
-# ---------------------------------------------------
-def api_call(url, method="POST", **kwargs):
-    """Makes a request. If 401/403, relogs in and retries ONCE."""
-    token = st.session_state.get("token")
-    headers = kwargs.pop("headers", {})
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    kwargs["headers"] = headers
-    kwargs.setdefault("timeout", 30)
-    kwargs.setdefault("verify", VERIFY_SSL)
-    
-    try:
-        res = session.request(method, url, **kwargs)
-        if res.status_code in (401, 403):
-            u, p = st.session_state.get("username"), st.session_state.get("password")
-            if u and p:
-                login_res = session.post(
-                    f"{BASE_URL}/pam/api/auth/login",
-                    headers=BASE_HEADERS,
-                    json={"usernameOrEmail": u, "password": p, "remember": True},
-                    timeout=30, verify=VERIFY_SSL
-                )
-                if login_res.ok and login_res.json().get("status"):
-                    new_token = login_res.json()["data"]["accessToken"]
-                    st.session_state["token"] = new_token
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    kwargs["headers"] = headers
-                    res = session.request(method, url, **kwargs)
-        return res
-    except Exception as e:
-        st.error(f"API Error: {e}")
-        return None
-
-def login_api(username, password):
-    try:
-        with st.spinner("Logging in..."):
-            res = api_call(f"{BASE_URL}/pam/api/auth/login", headers=BASE_HEADERS, 
-                           json={"usernameOrEmail": username, "password": password, "remember": True})
-        if not res or res.status_code != 200:
-            st.error(f"Server Error: {res.status_code if res else 'No Response'}")
-            return False
-        data = res.json()
-        if not data.get("status"):
-            st.error("Invalid username or password")
-            return False
-            
-        user = data["data"]["user"]
-        roles = user.get("roles", [])
-        role_id = roles[0].get("roleId") if roles else None
-        if not role_id:
-            st.error("No valid role assigned")
-            return False
-            
-        st.session_state.update({
-            "token": data["data"]["accessToken"],
-            "user_id": user.get("userId"),
-            "office_id": user.get("officeId"),
-            "role_id": role_id,
-            "username": username, "password": password, "logged_in": True
-        })
-        return True
-    except Exception as e:
-        st.error(f"Login Error: {e}")
+def verify_auth_code(conn, user_name, auth_code):
+    cursor = conn.cursor()
+    cursor.execute("SELECT auth_code FROM users WHERE name = ?", (user_name,))
+    result = cursor.fetchone()
+    if not result:
         return False
+    return auth_code == result[0]
 
-@st.cache_data(ttl=300)
-def fetch_registration_data_cached(token, user_id, role_id, office_id, pid):
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {"pid": pid, "statusid": 1, "userid": user_id, "roleid": role_id, "officeid": office_id}
+def log_email(conn, user_name, institution_name, recipients, ref_no):
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO email_logs (
+        user_name, institution_name, recipients, ref_no, sent_at
+    ) VALUES (?, ?, ?, ?, ?)
+    """, (
+        user_name, institution_name, recipients, ref_no,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    conn.commit()
+
+def get_email_logs(conn):
+    query = """
+    SELECT id, user_name, institution_name, recipients, ref_no, sent_at
+    FROM email_logs
+    ORDER BY datetime(sent_at) DESC
+    """
+    return pd.read_sql_query(query, conn)
+
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
+
+def validate_ref_no(ref_no):
+    ref_no = ref_no.upper()
+    return len(ref_no) == 9 and ref_no.startswith("RK")
+
+def validate_email(email):
+    pattern = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+    return re.match(pattern, email)
+
+def validate_cc_emails(cc_text):
+    if not cc_text.strip():
+        return True, []
+    emails = [e.strip() for e in cc_text.split(",") if e.strip()]
+    for email in emails:
+        if not validate_email(email):
+            return False, []
+    return True, emails
+
+def validate_files(uploaded_files):
+    total_size = 0
+    for file in uploaded_files:
+        ext = os.path.splitext(file.name)[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            return False, f"Invalid file type: {file.name}"
+        if file.size > MAX_FILE_SIZE:
+            return False, f"{file.name} exceeds 10MB limit"
+        total_size += file.size
+
+    if total_size > MAX_TOTAL_SIZE:
+        return False, "Total attachment size exceeds 25MB"
+    return True, ""
+
+def send_email_action(to_email, cc_list, uploaded_files):
+    GMAIL_USER = os.getenv("GMAIL_USER")
+    GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+
+    msg = EmailMessage()
+    msg["Subject"] = "रोक्का जानकारी"
+    msg["From"] = GMAIL_USER
+    msg["To"] = to_email
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+
+    signature = """
+    भूमि प्रशासन कार्यालय
+    चावहिल, काठमाण्डौं
+
+    Land Administration Office
+    Chabahil, Kathmandu
+
+    📞 Phone: 01-4822617, 01-4822618
+    ✉️ Email: chabahil@dolma.gov.np, bpkchabahil@dolma.gov.np
+    🌐 Website: https://chabahil.dolma.gov.np/office/chabahil
+    """
+    msg.set_content(signature)
+
+    for file in uploaded_files:
+        file_name = file["name"]
+        file_data = file["data"]
+        ext = os.path.splitext(file_name)[1].lower()
+
+        if ext == ".pdf":
+            maintype = "application"
+            subtype = "pdf"
+        elif ext == ".docx":
+            maintype = "application"
+            subtype = "vnd.openxmlformats-officedocument.wordprocessingml.document"
+        else:
+            continue
+
+        msg.add_attachment(file_data, maintype=maintype, subtype=subtype, filename=file_name)
+
+    recipients = [to_email] + cc_list
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.send_message(msg, from_addr=GMAIL_USER, to_addrs=recipients)
+
+# =========================================================
+# UI PAGE - SEND EMAIL
+# =========================================================
+
+def render_send_email_page(conn, selected_user, institution_names, institution_email_map):
+    st.title("📧 Daily Email Sender")
+
+    with st.form("email_form"):
+        uploaded_files = st.file_uploader("Upload Documents (.pdf, .docx)", type=["pdf", "docx"], accept_multiple_files=True)
+        selected_institution = st.selectbox("Select Institution", institution_names)
+        cc_emails = st.text_input("CC Emails (optional)", placeholder="manager@bank.com, auditor@firm.org")
+        ref_no = st.text_input("Reference Number", placeholder="RK1234567").upper()
+        submitted = st.form_submit_button("Send Email")
+
+    if submitted:
+        GMAIL_USER = os.getenv("GMAIL_USER")
+        GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+        if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+            st.error("Email credentials missing in .env")
+            st.stop()
+
+        if not validate_ref_no(ref_no):
+            st.error("Reference Number must:\n- Start with RK\n- Be exactly 9 characters")
+            st.stop()
+
+        if not uploaded_files:
+            st.error("Please upload at least one file.")
+            st.stop()
+
+        files_valid, file_error = validate_files(uploaded_files)
+        if not files_valid:
+            st.error(file_error)
+            st.stop()
+
+        cc_valid, cc_list = validate_cc_emails(cc_emails)
+        if not cc_valid:
+            st.error("Invalid CC email format.")
+            st.stop()
+
+        saved_files = [{"name": file.name, "type": file.type, "data": file.getvalue()} for file in uploaded_files]
+
+        st.session_state.form_data = {
+            "selected_user": selected_user,
+            "uploaded_files": saved_files,
+            "selected_institution": selected_institution,
+            "cc_list": cc_list,
+            "ref_no": ref_no
+        }
+        st.session_state.show_auth_popup = True
+        st.rerun()
+
+    if st.session_state.show_auth_popup:
+        auth_popup()
+
+    if st.session_state.sending_email:
+        process_email_sending(conn, institution_email_map)
+
+@st.dialog("Authorization Required")
+def auth_popup():
+    st.write("Enter authorization code to send email.")
+    auth_code = st.text_input("Authorization Code", type="password")
     
-    res = api_call(f"{BASE_URL}/pam/app/allregprocess", json=payload, headers=headers)
-    if not res or res.status_code != 200:
-        return pd.DataFrame()
-        
-    data = res.json().get("data", [])
-    if not data:
-        return pd.DataFrame()
-        
-    df = pd.DataFrame([{
-        "reference_no": r.get("referenceno"),
-        "username": r.get("username"),
-        "date": r.get("dateofapplication"),
-        "process": r.get("processname"),
-        "agency": r.get("rokkaagency")
-    } for r in data])
+    col1, col2 = st.columns(2)
+    with col1:
+        send_btn = st.button("Confirm & Send", use_container_width=True)
+    with col2:
+        cancel_btn = st.button("Cancel", use_container_width=True)
+
+    if cancel_btn:
+        st.session_state.show_auth_popup = False
+        st.rerun()
+
+    if send_btn:
+        selected_user = st.session_state.form_data["selected_user"]
+        with sqlite3.connect(DB_NAME) as temp_conn:
+            if not verify_auth_code(temp_conn, selected_user, auth_code):
+                st.error("Invalid authorization code.")
+                return
+
+        st.session_state.show_auth_popup = False
+        st.session_state.sending_email = True
+        st.rerun()
+
+def process_email_sending(conn, institution_email_map):
+    data = st.session_state.form_data
+    selected_user = data["selected_user"]
+    uploaded_files = data["uploaded_files"]
+    selected_institution = data["selected_institution"]
+    cc_list = data["cc_list"]
+    ref_no = data["ref_no"]
+    to_email = institution_email_map[selected_institution]
+
+    with st.spinner("Sending email..."):
+        try:
+            send_email_action(to_email=to_email, cc_list=cc_list, uploaded_files=uploaded_files)
+
+            all_recipients = [to_email] + cc_list
+            recipients_str = ", ".join(all_recipients)
+            
+            log_email(conn, user_name=selected_user, institution_name=selected_institution, recipients=recipients_str, ref_no=ref_no)
+
+            st.success("✅ Email sent successfully.")
+            st.toast("Email delivered successfully.")
+            st.balloons()
+        except smtplib.SMTPAuthenticationError:
+            st.error("SMTP Authentication failed.")
+        except smtplib.SMTPException as e:
+            st.error(f"SMTP Error: {str(e)}")
+        except Exception as e:
+            st.exception(e)
+
+    st.session_state.sending_email = False
+    st.session_state.form_data = {}
+
+# =========================================================
+# UI PAGE - DASHBOARD
+# =========================================================
+
+def apply_dashboard_filters(df):
+    st.sidebar.subheader("🔍 Filters")
     
-    df["reference_no"] = pd.to_numeric(df["reference_no"], errors="coerce").astype("Int64")
-    return df.sort_values("reference_no", ascending=False).reset_index(drop=True)
-
-@st.cache_data(ttl=600)
-def fetch_detail_cached(ref, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    res = api_call(f"{BASE_URL}/pam/app/rokka/application/detail/{ref}", headers=headers)
-    if res and res.status_code == 200:
-        return res.json().get("data")
-    return None
-
-# ---------------------------------------------------
-# ROW ACTIONS
-# ---------------------------------------------------
-def do_transfer(ref, process_name):
-
-    pn = (process_name or "").lower()
-
-    if "rokka" in pn:
-        url = f"{BASE_URL}/pam/app/rokka/data/send/{ref}"
-        method = "POST"
-
-    elif "fukuwa" in pn:
-        url = f"{BASE_URL}/pam/app/fukuwa/data/send/{ref}"
-        method = "GET"
-
-    else:
-        url = f"{BASE_URL}/pam/app/all/data/send/{ref}"
-        method = "POST"
-
-    res = api_call(
-        url,
-        method=method,
-        json={} if method == "POST" else None
-    )
-
-    if res and res.ok:
-
-        d = res.json()
-
-        if d.get("status"):
-
-            ref_no = d.get("data", {}).get("referenceNo", "N/A")
-
-            st.session_state["flash_message"] = (
-                f"✅ Transfer Successful | Ref No: {ref_no}"
-            )
-
-            st.session_state["flash_type"] = "success"
-
-        else:
-
-            st.session_state["flash_message"] = (
-                f"❌ Failed: {d.get('message', 'Unknown Error')}"
-            )
-
-            st.session_state["flash_type"] = "error"
-
-    else:
-
-        st.session_state["flash_message"] = (
-            f"❌ Transfer Error: {res.status_code if res else 'No Response'}"
-        )
-
-        st.session_state["flash_type"] = "error"
-
-
-def do_return(ref, remarks):
-
-    url = f"{BASE_URL}/pam/app/submit/deed/application/{ref}/6"
-
-    res = api_call(
-        url,
-        json={"remarks": remarks}
-    )
-
-    if res and res.ok:
-
-        d = res.json()
-
-        if d.get("status"):
-
-            st.session_state["flash_message"] = (
-                f"✅ Returned Successfully | ID: {d.get('data')}"
-            )
-
-            st.session_state["flash_type"] = "success"
-
-        else:
-
-            st.session_state["flash_message"] = (
-                f"❌ Failed: {d.get('message', 'Unknown Error')}"
-            )
-
-            st.session_state["flash_type"] = "error"
-
-    else:
-
-        st.session_state["flash_message"] = (
-            f"❌ Return Error: {res.status_code if res else 'No Response'}"
-        )
-
-        st.session_state["flash_type"] = "error"
-
-# ---------------------------------------------------
-# FLASH MESSAGE
-# ---------------------------------------------------
-def show_flash():
-
-    msg = st.session_state.get("flash_message")
-    msg_type = st.session_state.get("flash_type", "info")
-
-    if msg:
-
-        if msg_type == "success":
-            st.success(msg)
-
-        elif msg_type == "error":
-            st.error(msg)
-
-        elif msg_type == "warning":
-            st.warning(msg)
-
-        else:
-            st.info(msg)
-
-        # Keep message visible for one full render cycle
-        if st.session_state.get("_clear_flash_next"):
-            st.session_state["flash_message"] = None
-            st.session_state["flash_type"] = None
-            st.session_state["_clear_flash_next"] = False
-
-        else:
-            st.session_state["_clear_flash_next"] = True
-
-def render_table(page_name):
-    pid = PROCESS_IDS[page_name]
-    is_rokka = (page_name == "Rokka/Fukuwa")
+    bank_list = sorted(df["institution_name"].unique().tolist())
+    bank_filter = st.sidebar.selectbox("Bank Name", ["All"] + bank_list)
     
-    # Lazy Load Data
-    if st.session_state["table_data"] is None or st.session_state.get("_last_pid") != pid:
-        with st.spinner(f"Loading {page_name}..."):
-            df = fetch_registration_data_cached(
-                st.session_state["token"],
-                st.session_state["user_id"],
-                st.session_state["role_id"],
-                st.session_state["office_id"],
-                pid
-            )
-            st.session_state["table_data"] = df
-            st.session_state["_last_pid"] = pid
-            st.session_state["page_num"] = 1
-            st.session_state["search_query"] = ""
-            st.session_state["expanded_row"] = None
-            st.session_state["return_mode_ref"] = None
+    user_list = sorted(df["user_name"].unique().tolist())
+    user_filter = st.sidebar.selectbox("User", ["All"] + user_list)
+    
+    ref_filter = st.sidebar.text_input("Reference Number", placeholder="RK1234567")
+    date_range = st.sidebar.date_input("Date Range", [])
 
-    df = st.session_state["table_data"]
+    filtered_df = df.copy()
+
+    if bank_filter != "All":
+        filtered_df = filtered_df[filtered_df["institution_name"] == bank_filter]
+    if user_filter != "All":
+        filtered_df = filtered_df[filtered_df["user_name"] == user_filter]
+    if ref_filter.strip():
+        filtered_df = filtered_df[filtered_df["ref_no"].str.contains(ref_filter.strip(), case=False, na=False)]
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+        filtered_df = filtered_df[(filtered_df["date"] >= start_date) & (filtered_df["date"] <= end_date)]
+
+    return filtered_df
+
+def render_dashboard_metrics(filtered_df):
+    total_emails = len(filtered_df)
+    total_banks = filtered_df["institution_name"].nunique()
+    total_users = filtered_df["user_name"].nunique()
+    latest_email = filtered_df["sent_at"].max()
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Emails", total_emails)
+    with col2:
+        st.metric("Banks", total_banks)
+    with col3:
+        st.metric("Users", total_users)
+    with col4:
+        st.metric("Latest Email", latest_email.strftime("%Y-%m-%d") if pd.notnull(latest_email) else "N/A")
+
+def render_dashboard_charts(filtered_df):
+    st.subheader("📈 Emails by Bank")
+    st.bar_chart(filtered_df["institution_name"].value_counts())
+
+    st.subheader("📈 Emails by User")
+    st.bar_chart(filtered_df["user_name"].value_counts())
+
+    st.subheader("📈 Emails Per Day")
+    daily_chart = filtered_df.groupby(filtered_df["sent_at"].dt.date).size()
+    st.line_chart(daily_chart)
+
+def render_dashboard_table(filtered_df):
+    st.subheader("📋 Email Logs")
+    display_df = filtered_df.copy()
+    display_df["sent_at"] = display_df["sent_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    csv = display_df.to_csv(index=False)
+    st.download_button(label="⬇ Download CSV", data=csv, file_name="email_logs.csv", mime="text/csv")
+
+def render_email_logs_dashboard(conn):
+    st.title("📊 Email Logs Dashboard")
+
+    df = get_email_logs(conn)
     if df.empty:
-        st.info("No records found.")
+        st.warning("No email logs found.")
         return
 
-    # Search
-    search = st.text_input("🔍 Search", value=st.session_state["search_query"], key="search_input")
-    if search:
-        mask = df.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
-        df = df[mask]
-    st.session_state["search_query"] = search
+    df["sent_at"] = pd.to_datetime(df["sent_at"])
+    df["date"] = df["sent_at"].dt.date
+
+    filtered_df = apply_dashboard_filters(df)
     
-    total = len(df)
-    total_pages = max(1, math.ceil(total / ROWS_PER_PAGE))
-    st.session_state["page_num"] = max(1, min(st.session_state["page_num"], total_pages))
-    
-    # Pagination
-    c1, _, _, c2 = st.columns([1, 2, 2, 1])
-    if c1.button("⬅ Prev", disabled=st.session_state["page_num"]==1, key="btn_prev"):
-        st.session_state["page_num"] -= 1; st.session_state["expanded_row"] = None; st.session_state["return_mode_ref"] = None; st.rerun()
-    c2.text(f"Page {st.session_state['page_num']}/{total_pages} ({total} records)")
-    if c2.button("Next ➡", disabled=st.session_state["page_num"]==total_pages, key="btn_next"):
-        st.session_state["page_num"] += 1; st.session_state["expanded_row"] = None; st.session_state["return_mode_ref"] = None; st.rerun()
-        
-    st.download_button("📥 Export CSV", df.to_csv(index=False).encode("utf-8"), f"{page_name}.csv", "text/csv", key="btn_csv")
+    render_dashboard_metrics(filtered_df)
     st.divider()
-
-    # Table Header
-    col_defs = st.columns([1.5, 1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8]) if is_rokka else st.columns([1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8])
-    headers = ["Ref No", "User", "Date", "Process", "Agency", "", "", ""] if is_rokka else ["Ref No", "User", "Date", "Process", "", "", ""]
-    for i, h in enumerate(headers):
-        col_defs[i].markdown(f"**{h}**")
-    st.divider()
-
-    # Table Rows
-    start = (st.session_state["page_num"] - 1) * ROWS_PER_PAGE
-    page_df = df.iloc[start:start+ROWS_PER_PAGE]
     
-    for _, row in page_df.iterrows():
-        ref = str(row["reference_no"])
-        cols = st.columns([1.5, 1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8]) if is_rokka else st.columns([1.5, 1.5, 1.5, 1.5, 0.6, 0.8, 0.8])
-        
-        idx_offset = 5 if is_rokka else 4
-        cols[0].write(ref)
-        cols[1].write(row["username"])
-        cols[2].write(row["date"])
-        cols[3].write(row["process"])
-        if is_rokka:
-            cols[4].write(row.get("agency", "-") or "-")
+    render_dashboard_charts(filtered_df)
+    st.divider()
+    
+    render_dashboard_table(filtered_df)
 
-        # View Button (Rokka/Fukuwa Only)
-        expanded = st.session_state.get("expanded_row") == ref
-        if is_rokka:
-            if cols[idx_offset].button("👁️ View" if not expanded else "Hide", key=f"view_{ref}", type="primary" if not expanded else "secondary", use_container_width=True):
-                if expanded: st.session_state["expanded_row"] = None
-                else: st.session_state["expanded_row"] = ref
-                st.session_state["return_mode_ref"] = None
-                st.rerun()
+# =========================================================
+# MAIN APP
+# =========================================================
 
-        # Transfer Button
-        if cols[idx_offset+1].button("🔄 Transfer", key=f"tr_{ref}", use_container_width=True):
-            do_transfer(ref, row["process"])
-            st.rerun()
-            
-        # Return Button
-        return_mode = st.session_state.get("return_mode_ref") == ref
-        if cols[idx_offset+2].button("↩️ Return", key=f"ret_{ref}", use_container_width=True):
-            if not return_mode:
-                st.session_state["return_mode_ref"] = ref
-                st.session_state["expanded_row"] = None
-                st.rerun()
-
-        # Inline Return Form
-        if return_mode:
-            with st.container(border=True):
-                remarks = st.text_input("Remarks", value="भू सेवाबाट माग भए बमोजिम फिर्ता ।", key=f"remarks_{ref}")
-                c_c, c_x = st.columns(2)
-                if c_c.button("✅ Confirm Return", key=f"conf_ret_{ref}", type="primary", use_container_width=True):
-                    do_return(ref, remarks)
-                    st.session_state["return_mode_ref"] = None
-                    st.rerun()
-                if c_x.button("❌ Cancel", key=f"cancel_ret_{ref}", use_container_width=True):
-                    st.session_state["return_mode_ref"] = None
-                    st.rerun()
-            st.divider()
-
-        # Expanded Detail (Rokka/Fukuwa Only)
-        if expanded and is_rokka:
-            with st.container(border=True):
-                detail = fetch_detail_cached(ref, st.session_state["token"])
-                if detail:
-                    # Exact logic from original app.py
-                    process = detail.get("PROCESSREGISTRATION", {})
-                    prop = detail.get("PROPERTYDETAIL", [])
-
-                    munc = "-"
-                    if isinstance(prop, list) and len(prop) > 0: 
-                        munc = prop[0].get("MUNCNAME_NP", "-")
-                    agency_detail = "-"
-
-                    process_name = process.get("processname", " ").lower()
-
-                    if "rokka" in process_name:
-                        rokka_info = detail.get("ROKKAINFORMATION", [])
-                        if isinstance(rokka_info, list) and len(rokka_info) > 0:
-                            agency_detail = rokka_info[0].get("AGENCYNAME_NP", "-")
-                    else:
-                        fukuwa = detail.get("data", {}).get("fukuwaDetails", [])
-                        if isinstance(fukuwa, list) and len(fukuwa) > 0:
-                            agency_detail = fukuwa[0].get("tblrokkaagency", {}).get("agencyname_np", "-")
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    # c1.metric("Municipality", munc)
-                    # c2.metric("Agency", agency_detail)
-                    # c3.metric("Process", process.get("processname", "-"))
-                    # c4.metric("Date", process.get("dateofapplication", "-"))
-
-                    c1.markdown(f"**Municipality**  \n<small>{munc}</small>", unsafe_allow_html=True)
-                    c2.markdown(f"**Agency**  \n<small>{agency_detail}</small>", unsafe_allow_html=True)
-                    c3.markdown(f"**Process**  \n<small>{process.get('processname', '-')}</small>", unsafe_allow_html=True)
-                    c4.markdown(f"**Date**  \n<small>{process.get('dateofapplication', '-')}</small>", unsafe_allow_html=True)
-                else:
-                    st.error("❌ Failed to load detail data")
-            st.divider()
-
-def sidebar():
-    st.sidebar.title("🏛️ DOLMA Portal")
-    st.sidebar.caption(f"👤 {st.session_state.get('username', '')}")
+def render_sidebar(users):
+    st.sidebar.title("📂 Navigation")
+    st.sidebar.subheader("Email Id: bpkchabahil@gmail.com")
+    menu = st.sidebar.radio("Go To", ["Send Email", "Email Logs Dashboard"])
     st.sidebar.divider()
     
-    selected = st.sidebar.radio("📂 Workspaces", PAGES, key="nav_radio", index=PAGES.index(st.session_state["selected_page"]))
-    st.session_state["selected_page"] = selected
-    
-    # Reset state on page switch
-    if selected != st.session_state.get("_last_page_rendered"):
-        st.session_state["_last_page_rendered"] = selected
-        st.session_state["table_data"] = None
-        st.session_state["page_num"] = 1
-        st.session_state["expanded_row"] = None
-        
-    st.sidebar.divider()
-    if st.sidebar.button("🧹 Clear Cache", key="btn_cache"): st.cache_data.clear(); st.sidebar.success("Cache cleared")
-    if st.sidebar.button("🚪 Logout", key="btn_logout"): st.session_state.clear(); st.rerun()
-
-def login_page():
-    st.markdown("""
-        <style>
-
-        section[data-testid="stSidebar"] {
-            display: none !important;
-        }
-
-        div[data-testid="collapsedControl"] {
-            display: none !important;
-        }
-
-        </style>
-    """, unsafe_allow_html=True)
-
-    _, center, _ = st.columns([3, 1.2, 3])
-    with center:
-        st.title("🔐 DOLMA Login")
-        username = st.text_input("Username", key="login_user")
-        password = st.text_input("Password", type="password", key="login_pass")
-        if st.button("Sign In", use_container_width=True, type="primary", key="btn_login"):
-            if not username or not password:
-                st.warning("Enter credentials")
-                return
-            if login_api(username, password):
-                st.success("Login successful")
-                st.rerun()
-
-def dashboard_page():
-
-    st.title("🏛️ DOLMA Dashboard")
-
-    # Compact centered quick response section
-    left, center, right = st.columns([1.5, 2, 1.5])
-
-    with center:
-
-        st.markdown("### ⚡ Quick Response")
-
-        with st.container(border=True):
-
-            t_id = st.text_input(
-                "Reference No.",
-                max_chars=7,
-                placeholder="Enter 7-digit Reference No.",
-                key="dash_ref"
-            )
-
-            t_type = st.selectbox(
-                "Type",
-                ["Rokka", "Fukuwa", "Others"],
-                key="dash_type"
-            )
-
-            remarks = st.text_area(
-                "Remarks",
-                value="भू सेवाबाट माग भए बमोजिम फिर्ता ।",
-                height=70,
-                key="dash_remarks"
-            )
-
-            is_valid = t_id.isdigit() and len(t_id) == 7
-
-            if t_id and not is_valid:
-                st.warning("⚠️ Enter exactly 7 digits")
-
-            col1, col2 = st.columns(2)
-
-            # TRANSFER
-            if col1.button(
-                "🔄 Transfer",
-                use_container_width=True,
-                type="primary"
-            ):
-
-                if not is_valid:
-
-                    st.warning("Enter valid 7-digit ID")
-
-                else:
-
-                    do_transfer(t_id, t_type)
-                    st.rerun()
-
-            # RETURN
-            if col2.button(
-                "↩️ Return",
-                use_container_width=True
-            ):
-
-                if not is_valid:
-
-                    st.warning("Enter valid 7-digit ID")
-
-                elif not remarks.strip():
-
-                    st.warning("Remarks cannot be empty")
-
-                else:
-
-                    do_return(t_id, remarks)
-                    st.rerun()
-
-    # Placeholder for future sections
-    st.markdown("---")
-
-    st.markdown("### 📊 Upcoming Dashboard Sections")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        with st.container(border=True):
-            st.markdown("#### Pending")
-            st.caption("Future widget area")
-
-    with col2:
-        with st.container(border=True):
-            st.markdown("#### Recent Activity")
-            st.caption("Future widget area")
-
-    with col3:
-        with st.container(border=True):
-            st.markdown("#### Statistics")
-            st.caption("Future widget area")
+    st.sidebar.title("👤 User")
+    selected_user = st.sidebar.selectbox("Select User", users)
+    return menu, selected_user
 
 def main():
+    st.set_page_config(page_title="Financial Email Sender", page_icon="📧", layout="wide")
+    load_dotenv()
+    
+    conn = init_db()
+    init_session_state()
 
-    if not st.session_state["logged_in"]:
-        login_page()
-        return
+    users = get_users(conn)
+    institutions = get_institutions(conn)
+    institution_names = [inst[0] for inst in institutions]
+    institution_email_map = {name: email for name, email in institutions}
 
-    sidebar()
+    menu, selected_user = render_sidebar(users)
 
-    show_flash()
+    if menu == "Send Email":
+        render_send_email_page(conn, selected_user, institution_names, institution_email_map)
+    elif menu == "Email Logs Dashboard":
+        render_email_logs_dashboard(conn)
 
-    selected = st.session_state["selected_page"]
-
-    if selected == "Dashboard":
-        dashboard_page()
-
-    else:
-        render_table(selected)
+    conn.close()
 
 if __name__ == "__main__":
     main()
